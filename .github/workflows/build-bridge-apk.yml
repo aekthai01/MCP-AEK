@@ -21,13 +21,18 @@ jobs:
           cd bridge
           git checkout 27eae4c00ea482b44550a68968a44bd34548786e
 
-      - name: Patch current ChatGPT composer DOM selectors
+      - name: Patch current ChatGPT composer and response DOM selectors
         run: python scripts/patch-chatgpt-bridge.py
 
       - name: Verify patch
         run: |
-          grep -n "form\[data-chatgpt-composer\]" bridge/app/src/main/java/com/cgfree/net/WebViewChatEngine.kt
-          grep -n "composer-submit-button" bridge/app/src/main/java/com/cgfree/net/WebViewChatEngine.kt
+          TARGET=bridge/app/src/main/java/com/cgfree/net/WebViewChatEngine.kt
+          grep -n "form\[data-chatgpt-composer\]" "$TARGET"
+          grep -n "composer-submit-button" "$TARGET"
+          grep -n "section\[data-turn=\"assistant\"\]" "$TARGET"
+          grep -n "conversation-turn-" "$TARGET"
+          grep -n "send-accepted-by=" "$TARGET"
+          grep -n "userCount()" "$TARGET"
 
       - name: Set up JDK 17
         uses: actions/setup-java@v5
