@@ -51,15 +51,18 @@ class Settings:
     tool_timeout: int
     max_tool_rounds: int
     max_file_bytes: int
+    context_bytes: int = 60000
 
     @classmethod
     def load(cls) -> "Settings":
         state = _read_state()
         root = _expand_path(os.getenv("AEK_WORKSPACE_ROOT", "~/mcp-aek/workspaces"))
-        active = str(state.get("active_workspace") or os.getenv("AEK_ACTIVE_WORKSPACE", "default")).strip()
+        active = str(os.getenv("AEK_PINNED_WORKSPACE") or state.get("active_workspace") or os.getenv("AEK_ACTIVE_WORKSPACE", "default")).strip()
         if not active or active in {".", ".."} or "/" in active or "\\" in active:
             active = "default"
         root.mkdir(parents=True, exist_ok=True)
+        if (root / active).is_symlink():
+            raise ValueError("workspace cannot be a symlink")
         (root / active).mkdir(parents=True, exist_ok=True)
         return cls(
             upstream_base_url=os.getenv("AEK_UPSTREAM_BASE_URL", "http://127.0.0.1:5656/v1").rstrip("/"),
@@ -70,12 +73,15 @@ class Settings:
             enable_shell=_env_bool("AEK_ENABLE_SHELL", False),
             tool_timeout=max(1, int(os.getenv("AEK_TOOL_TIMEOUT", "120"))),
             max_tool_rounds=max(1, int(os.getenv("AEK_MAX_TOOL_ROUNDS", "24"))),
+            context_bytes=max(4096, int(os.getenv("AEK_CONTEXT_BYTES", "60000"))),
             max_file_bytes=max(1024, int(os.getenv("AEK_MAX_FILE_BYTES", "1048576"))),
         )
 
     @property
     def workspace(self) -> Path:
         path = (self.workspace_root / self.active_workspace).resolve()
+        if path.parent != self.workspace_root.resolve():
+            raise ValueError("workspace escapes root")
         path.mkdir(parents=True, exist_ok=True)
         return path
 
@@ -85,6 +91,8 @@ def set_active_workspace(name: str) -> Path:
     if not name or name in {".", ".."} or "/" in name or "\\" in name:
         raise ValueError("workspace name must be one simple directory name")
     settings = Settings.load()
+    if (settings.workspace_root / name).is_symlink():
+        raise ValueError("workspace cannot be a symlink")
     path = (settings.workspace_root / name).resolve()
     if settings.workspace_root not in path.parents and path != settings.workspace_root:
         raise ValueError("workspace escapes root")
@@ -97,4 +105,4 @@ def set_active_workspace(name: str) -> Path:
 
 def list_workspaces() -> list[str]:
     settings = Settings.load()
-    return sorted(p.name for p in settings.workspace_root.iterdir() if p.is_dir())
+    return sorted(p.name for p in settings.workspace_root.iterdir() if p.is_dir() and not p.is_symlink())

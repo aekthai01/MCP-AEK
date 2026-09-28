@@ -7,6 +7,7 @@ import sys
 
 from .agent import AEKAgent
 from .config import Settings, list_workspaces, set_active_workspace
+from .sessions import SessionStore, sanitize
 
 
 async def _cmd_run(prompt: str) -> int:
@@ -21,9 +22,10 @@ async def _cmd_run(prompt: str) -> int:
 
 async def _cmd_chat() -> int:
     agent = AEKAgent()
-    history: list[dict] = []
+    store = SessionStore(agent.settings.workspace, (agent.settings.upstream_api_key,))
+    sid = store.current()["id"]
     print(f"MCP-AEK | workspace={agent.settings.active_workspace} | model={agent.settings.model}")
-    print("Type /exit to quit, /doctor for diagnostics, /clear to reset chat context.")
+    print("Type /exit to quit, /doctor for diagnostics, /clear to start a new session (old history is retained).")
     try:
         while True:
             try:
@@ -36,17 +38,20 @@ async def _cmd_chat() -> int:
             if prompt in {"/exit", "/quit"}:
                 return 0
             if prompt == "/clear":
-                history = []
-                print("context cleared")
+                with store.execution_lock():
+                    sid = store.create()["id"]
+                print("new session created; previous history retained")
                 continue
             if prompt == "/doctor":
                 print(json.dumps(await agent.doctor(), ensure_ascii=False, indent=2))
                 continue
             try:
-                answer, history = await agent.run(prompt, history=history)
+                with store.execution_lock():
+                    history = store.history(sid, agent.settings.context_bytes)
+                    answer, _ = await agent.run(prompt, history=history, store=store, session_id=sid)
                 print(f"\nAEK> {answer}")
             except Exception as exc:
-                print(f"\nERROR: {type(exc).__name__}: {exc}", file=sys.stderr)
+                print(sanitize(f"\nERROR: {type(exc).__name__}: {exc}", (agent.settings.upstream_api_key,)), file=sys.stderr)
     finally:
         await agent.close()
 
@@ -102,7 +107,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="aek", description="MCP-AEK mobile engineering agent")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("chat", help="interactive chat with MCP tools")
+    chat = sub.add_parser("chat", help="persistent workspace chat and sessions")
+    chat.add_argument("action", nargs="?", choices=["new", "list", "use", "rename", "info", "delete", "summary"])
+    chat.add_argument("value", nargs="?")
+    chat.add_argument("--yes", action="store_true", help="confirm session deletion")
+    ui = sub.add_parser("ui", help="start the local mobile chat UI")
+    ui.add_argument("--port", type=int, default=8766)
+    ui.add_argument("--open", action="store_true")
 
     run_p = sub.add_parser("run", help="execute one task and print the final answer")
     run_p.add_argument("prompt")
@@ -126,8 +137,44 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _session_command(args):
+    settings = Settings.load()
+    store = SessionStore(settings.workspace, (settings.upstream_api_key,))
+    with store.execution_lock():
+        if args.action == 'new':
+            result = store.create(args.value or 'New session')
+        elif args.action == 'list':
+            active = store.current()['id']
+            for item in store.list():
+                print(f"{'*' if item['id'] == active else ' '} {item['id']}  {item['title']}  {item['message_count']} messages  {item['updated_at']}")
+            return 0
+        elif args.action == 'info':
+            result = store.current()
+        elif args.action == 'use':
+            result = store.use(args.value)
+        elif args.action == 'rename':
+            result = store.rename(store.current()['id'], args.value)
+        elif args.action == 'summary':
+            store.set_summary(store.current()['id'], args.value)
+            result = store.current()
+        elif args.action == 'delete':
+            if not args.yes:
+                print('Deletion requires --yes; history will be permanently removed.', file=sys.stderr)
+                return 2
+            store.delete(args.value)
+            result = {'deleted': args.value}
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
 def main() -> None:
     args = build_parser().parse_args()
+    if args.command == "ui":
+        from .web import serve
+        serve(args.port, args.open)
+        return
+    if args.command == "chat" and args.action:
+        raise SystemExit(_session_command(args))
     if args.command == "chat":
         raise SystemExit(asyncio.run(_cmd_chat()))
     if args.command == "run":

@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+import asyncio
+import time
 import json
 import os
 import sys
+from urllib.parse import urlsplit
 from typing import Any
 
 import httpx
 from mcp import Client, StdioServerParameters
 
 from .config import Settings
+from .sessions import context_messages, sanitize
 
 
 SYSTEM_PROMPT = """You are MCP-AEK, an engineering agent operating on a real Termux workspace.
@@ -58,7 +62,7 @@ def _parse_arguments(raw: Any) -> dict[str, Any]:
 class AEKAgent:
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or Settings.load()
-        self._http = httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=20.0))
+        self._http = httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=20.0), trust_env=urlsplit(self.settings.upstream_base_url).hostname not in {"127.0.0.1", "localhost", "::1"})
 
     async def close(self) -> None:
         await self._http.aclose()
@@ -67,7 +71,7 @@ class AEKAgent:
         return StdioServerParameters(
             command=sys.executable,
             args=["-m", "mcp_aek.server"],
-            env=os.environ.copy(),
+            env={**os.environ, "AEK_WORKSPACE_ROOT": str(self.settings.workspace_root), "AEK_PINNED_WORKSPACE": self.settings.active_workspace},
         )
 
     async def _upstream_models(self) -> list[str]:
@@ -102,7 +106,7 @@ class AEKAgent:
         except Exception as exc:
             info["mcp_ok"] = False
             info["mcp_error"] = f"{type(exc).__name__}: {exc}"
-        return info
+        return sanitize(info, (self.settings.upstream_api_key,))
 
     async def _completion(self, messages: list[dict[str, Any]], openai_tools: list[dict[str, Any]]) -> dict[str, Any]:
         headers = {
@@ -135,11 +139,20 @@ class AEKAgent:
             raise RuntimeError("upstream choice has no message object")
         return message
 
-    async def run(self, prompt: str, history: list[dict[str, Any]] | None = None) -> tuple[str, list[dict[str, Any]]]:
+    async def run(self, prompt: str, history: list[dict[str, Any]] | None = None, *, store=None, session_id=None, emit=None, recorded=False) -> tuple[str, list[dict[str, Any]]]:
         messages = list(history or [])
-        if not messages:
-            messages.append({"role": "system", "content": SYSTEM_PROMPT})
-        messages.append({"role": "user", "content": prompt})
+        async def event(kind, **data):
+            if emit:
+                emit(sanitize({"type": kind, **data}, (self.settings.upstream_api_key,)))
+
+        async def record(message):
+            messages.append(message)
+            if store:
+                await asyncio.to_thread(store.append, session_id, message)
+
+        if not recorded:
+            await record({"role": "user", "content": prompt})
+        await event("request_started")
 
         async with Client(self._stdio_server()) as client:
             listed = await client.list_tools()
@@ -157,15 +170,22 @@ class AEKAgent:
                 )
 
             for _round in range(self.settings.max_tool_rounds):
-                assistant = await self._completion(messages, openai_tools)
+                await event("model_started")
+                summary = (await asyncio.to_thread(store.info, session_id))["summary"] if store else ""
+                request = context_messages(messages, SYSTEM_PROMPT, self.settings.context_bytes, summary)
+                assistant = await self._completion(request, openai_tools)
+                await event("model_completed")
                 content = assistant.get("content") or ""
                 tool_calls = assistant.get("tool_calls") or []
 
                 if not tool_calls:
-                    messages.append({"role": "assistant", "content": content})
+                    await record({"role": "assistant", "content": content})
+                    await event("final_answer", content=content)
                     return content, messages
 
-                messages.append(
+                for index, call in enumerate(tool_calls):
+                    call["id"] = str(call.get("id") or f"call_{_round}_{index}")
+                await record(
                     {
                         "role": "assistant",
                         "content": content,
@@ -177,20 +197,30 @@ class AEKAgent:
                     function = call.get("function") or {}
                     name = str(function.get("name") or "")
                     call_id = str(call.get("id") or f"call_{_round}_{index}")
+                    started = time.monotonic()
+                    failed = False
+                    await event("tool_started", name=name, call_id=call_id, arguments=function.get("arguments"))
                     if not name:
+                        failed = True
                         tool_text = json.dumps({"error": "tool call missing function name"})
                     else:
                         try:
                             args = _parse_arguments(function.get("arguments"))
                             result = await client.call_tool(name, args)
                             tool_text = _tool_result_text(result)
+                            failed = bool(getattr(result, "is_error", False))
+                            structured = getattr(result, "structured_content", None)
+                            if isinstance(structured, dict):
+                                failed = failed or bool(structured.get("exit_code", 0))
                         except Exception as exc:
+                            failed = True
                             tool_text = json.dumps(
                                 {"error": f"{type(exc).__name__}: {exc}"},
                                 ensure_ascii=False,
                             )
 
-                    messages.append(
+                    await event("tool_failed" if failed else "tool_completed", name=name, call_id=call_id, duration_ms=round((time.monotonic()-started)*1000), result=tool_text[:12000])
+                    await record(
                         {
                             "role": "tool",
                             "tool_call_id": call_id,

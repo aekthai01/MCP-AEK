@@ -134,7 +134,7 @@ def search_text(query: str, path: str = ".", regex: bool = False, max_results: i
     results: list[dict[str, Any]] = []
     files = [base] if base.is_file() else base.rglob("*")
     for p in files:
-        if not p.is_file():
+        if p.is_symlink() or not p.is_file():
             continue
         if p.suffix.lower() not in TEXT_EXTENSIONS and p.name not in {"Makefile", "Dockerfile", "CMakeLists.txt"}:
             continue
