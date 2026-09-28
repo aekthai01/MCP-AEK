@@ -23,6 +23,14 @@ fi
 echo "      $(rustc --version)"
 echo "      $(cargo --version)"
 
+# Android/Termux can intermittently return ETXTBSY ("Text file busy") when
+# Cargo compiles and immediately executes multiple build scripts in parallel.
+# A single Cargo job is slower but reliable for maturin packages such as
+# pydantic-core, rpds-py and cryptography. Respect an explicit user override.
+export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}"
+export CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}"
+echo "      Cargo build jobs: $CARGO_BUILD_JOBS"
+
 # Useful reverse-engineering packages are not available in every Termux repository.
 # Install when available, but do not make the whole setup fail if a package is absent.
 echo '[2/6] Trying optional reverse-engineering packages...'
