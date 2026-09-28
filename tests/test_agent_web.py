@@ -107,8 +107,13 @@ class IntegrationTests(unittest.TestCase):
         self.assertTrue((self.root/'workspaces/.archived/second').is_dir())
         self.get('/api/workspaces',{'name':'third'})
         self.get('/api/workspaces',{'name':'default'})
-        self.get('/api/workspaces/remove',{'name':'third','mode':'delete','confirm_workspace':'third'})
+        self.get('/api/workspaces/rename',{'name':'third','new_name':'renamed-third'})
         self.assertFalse((self.root/'workspaces/third').exists())
+        self.assertTrue((self.root/'workspaces/renamed-third').exists())
+        self.get('/api/workspaces',{'name':'renamed-third'})
+        self.get('/api/workspaces',{'name':'default'})
+        self.get('/api/workspaces/remove',{'name':'renamed-third','mode':'delete','confirm_workspace':'renamed-third'})
+        self.assertFalse((self.root/'workspaces/renamed-third').exists())
     def test_model_selection_persists_and_respects_env_override(self):
         from mcp_aek.config import set_model
         with patch.dict(os.environ,{'AEK_MODEL':''}):

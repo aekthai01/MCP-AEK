@@ -116,7 +116,7 @@ manual checks above. Existing CI runs Python 3.12.
 ## v0.3 branch changes and device checks
 
 The UI now supports per-session actions, workspace-scoped clear-all, dark/light/system
-themes, workspace creation/selection/clone/archive/delete, bounded file browsing and
+themes, workspace creation/selection/clone/rename/archive/delete, bounded file browsing and
 text editing with diff preview, Git status/diff/staging/commits/branches, artifact
 discovery/download, and runtime model selection from the bridge's `/v1/models`.
 `GET /api/tasks` returns the newest 50 persisted task statuses. Sending `/api/chat`

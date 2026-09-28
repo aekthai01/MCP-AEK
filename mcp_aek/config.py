@@ -225,3 +225,22 @@ def remove_workspace(name: str, archive=False) -> None:
                 path.rename(target)
             else:
                 shutil.rmtree(path)
+
+
+def rename_workspace(name: str, new_name: str) -> Path:
+    from .sessions import SessionStore
+    if not isinstance(new_name, str) or not new_name or new_name != new_name.strip() or new_name.startswith('.') or '/' in new_name or '\\' in new_name or any(ord(c) < 32 for c in new_name):
+        raise ValueError('invalid new workspace name')
+    with _state_lock():
+        if name not in list_workspaces():
+            raise ValueError('workspace not found')
+        settings = Settings.load()
+        if name == settings.active_workspace:
+            raise ValueError('switch to another workspace before renaming')
+        source = settings.workspace_root / name
+        target = settings.workspace_root / new_name
+        if target.exists() or target.is_symlink():
+            raise ValueError('target workspace already exists')
+        with SessionStore(source).execution_lock():
+            source.rename(target)
+    return target

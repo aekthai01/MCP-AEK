@@ -15,7 +15,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 from .agent import AEKAgent
-from .config import Settings, set_active_workspace, clone_workspace, workspace_details, set_model, remove_workspace
+from .config import Settings, set_active_workspace, clone_workspace, workspace_details, set_model, remove_workspace, rename_workspace
 from .sessions import SessionStore, sanitize
 from .workspace import list_files, inspect_file, save_text, git, artifacts, safe_path, file_action
 
@@ -306,6 +306,8 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError('type the workspace name to confirm archive or deletion')
                 remove_workspace(name, archive=data['mode'] == 'archive')
                 return self.respond({'removed': name, 'mode': data['mode']})
+            if path == '/api/workspaces/rename':
+                return self.respond({'path': str(rename_workspace(data.get('name'), data.get('new_name')))})
             if path == '/api/models':
                 model = data.get('model')
                 if model not in asyncio.run(app.models()):
