@@ -8,7 +8,7 @@ text = path.read_text(encoding='utf-8')
 
 def sub_once(pattern: str, replacement: str, label: str) -> None:
     global text
-    text, count = re.subn(pattern, replacement, text, count=1, flags=re.S)
+    text, count = re.subn(pattern, lambda _m: replacement, text, count=1, flags=re.S)
     if count != 1:
         raise SystemExit(f'{label} patch target not found exactly once')
 
