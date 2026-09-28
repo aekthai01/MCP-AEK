@@ -6,6 +6,7 @@ on:
     branches: [main]
     paths:
       - 'scripts/patch-chatgpt-bridge.py'
+      - 'scripts/patch-chatgpt-bridge-body-fallback.py'
       - '.github/workflows/build-bridge-apk.yml'
 
 jobs:
@@ -22,7 +23,9 @@ jobs:
           git checkout 27eae4c00ea482b44550a68968a44bd34548786e
 
       - name: Patch current ChatGPT composer and response DOM selectors
-        run: python scripts/patch-chatgpt-bridge.py
+        run: |
+          python scripts/patch-chatgpt-bridge.py
+          python scripts/patch-chatgpt-bridge-body-fallback.py
 
       - name: Verify patch
         run: |
@@ -33,6 +36,8 @@ jobs:
           grep -n "conversation-turn-" "$TARGET"
           grep -n "send-accepted-by=" "$TARGET"
           grep -n "userCount()" "$TARGET"
+          grep -n "bodyAssistantText()" "$TARGET"
+          grep -n "bodyAssistantComplete()" "$TARGET"
 
       - name: Set up JDK 17
         uses: actions/setup-java@v5
