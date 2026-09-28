@@ -49,3 +49,12 @@ class CLITests(unittest.TestCase):
         self.assertEqual(json.loads(self.cli('chat','info'))['id'],info['id'])
         self.cli('chat','delete','renamed','--yes')
         self.assertNotIn('renamed',self.cli('chat','list'))
+    def test_missing_arguments_and_workspace_clear(self):
+        for command in ('use','rename','summary','delete'):
+            result=subprocess.run([sys.executable,'-m','mcp_aek.cli','chat',command],env=self.env,text=True,capture_output=True)
+            self.assertEqual(result.returncode,2)
+            self.assertNotIn('Traceback',result.stderr)
+        self.cli('chat','new','before-clear')
+        data=json.loads(self.cli('chat','clear-all','--yes'))
+        self.assertGreaterEqual(data['deleted_sessions'],1)
+        self.assertEqual(len(self.cli('chat','list').splitlines()),1)

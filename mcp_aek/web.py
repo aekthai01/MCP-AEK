@@ -16,8 +16,9 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 from .agent import AEKAgent
-from .config import Settings, list_workspaces, set_active_workspace
+from .config import Settings, list_workspaces, set_active_workspace, clone_workspace, workspace_details, set_model, remove_workspace
 from .sessions import SessionStore, sanitize
+from .workspace import list_files, inspect_file, save_text, git, artifacts, safe_path, file_action
 
 STATIC = Path(__file__).with_name('static')
 
@@ -67,20 +68,25 @@ class App:
                 raise ValueError('a task is already running')
             if session_id != self.session:
                 raise ValueError('active session changed; reload before sending')
-            with self.store.execution_lock():
+            reservation = self.store.execution_lock()
+            reservation.__enter__()
+            try:
                 self.store.append(self.session, {"role": "user", "content": prompt})
-            self.busy = True
-            self.request_id = uuid.uuid4().hex
-            threading.Thread(target=self.worker, args=(prompt,), daemon=True).start()
+                self.busy = True
+                self.request_id = uuid.uuid4().hex
+                threading.Thread(target=self.worker, args=(prompt, reservation), daemon=True).start()
+            except BaseException:
+                self.busy = False
+                reservation.__exit__(None, None, None)
+                raise
             return {'request_id': self.request_id}
 
-    def worker(self, prompt):
+    def worker(self, prompt, reservation):
         async def run():
             agent = self.agent_factory(self.settings)
             try:
-                with self.store.execution_lock():
-                    history = await asyncio.to_thread(self.store.history, self.session, self.settings.context_bytes)
-                    await agent.run(prompt, history, store=self.store, session_id=self.session, emit=self.emit, recorded=True)
+                history = await asyncio.to_thread(self.store.history, self.session, self.settings.context_bytes)
+                await agent.run(prompt, history, store=self.store, session_id=self.session, emit=self.emit, recorded=True)
             finally:
                 await agent.close()
         try:
@@ -89,8 +95,9 @@ class App:
             self.emit({'type': 'error', 'message': f'{type(exc).__name__}: {exc}'})
         finally:
             with self.lock:
-                self.busy = False
                 self.emit({'type': 'request_finished'})
+                reservation.__exit__(None, None, None)
+                self.busy = False
 
     async def diagnostics(self, tools_only=False):
         from mcp import Client
@@ -105,6 +112,13 @@ class App:
             info.update({'python': platform.python_version(), 'termux': '/com.termux/' in os.environ.get('PREFIX', '') or 'com.termux' in os.environ.get('PREFIX', ''), 'dependencies': {n: version(n) for n in ('mcp', 'httpx', 'python-dotenv')}, 'history_path': str(self.store.path), 'active_session': self.session, 'ui_backend': 'online'})
             info['tool_count'] = len(info.get('mcp_tools', []))
             return sanitize(info, (self.settings.upstream_api_key,))
+        finally:
+            await agent.close()
+
+    async def models(self):
+        agent = self.agent_factory(self.settings)
+        try:
+            return await agent._upstream_models()
         finally:
             await agent.close()
 
@@ -205,14 +219,32 @@ class Handler(BaseHTTPRequestHandler):
                         raise ValueError('diagnostics are unavailable while a task is running')
                     return self.respond(asyncio.run(app.diagnostics(path == '/api/tools')))
             with app.lock:
+                if path == '/api/models':
+                    if app.busy:
+                        raise ValueError('models unavailable while a task is running')
+                    return self.respond({'models': asyncio.run(app.models()), 'selected': app.settings.model})
                 if path == '/api/workspaces':
-                    return self.respond({'workspaces': list_workspaces(), 'active': app.settings.active_workspace})
+                    return self.respond({'workspaces': workspace_details(), 'active': app.settings.active_workspace})
+                if path == '/api/files':
+                    return self.respond({'entries': list_files(app.settings.workspace, query.get('path', [''])[0])})
+                if path == '/api/file':
+                    return self.respond(inspect_file(app.settings.workspace, query.get('path', [''])[0]))
+                if path == '/api/git':
+                    return self.respond(git(app.settings.workspace, query.get('action', ['status'])[0]))
+                if path == '/api/artifacts':
+                    return self.respond({'artifacts': artifacts(app.settings.workspace)})
+                if path == '/api/artifact':
+                    relative = query.get('path', [''])[0]
+                    target = safe_path(app.settings.workspace, relative)
+                    if target.suffix.lower() not in {'.apk', '.aab', '.so', '.c', '.log', '.pdf', '.zip', '.jar'} or not target.is_file() or target.stat().st_size > 20_000_000:
+                        raise ValueError('artifact is unavailable or exceeds 20 MB')
+                    return self.respond(target.read_bytes(), content_type='application/octet-stream')
                 if path == '/api/sessions':
                     return self.respond({'sessions': app.store.list(), 'active': app.session})
                 if path.startswith('/api/sessions/') and path.endswith('/messages'):
                     sid = path.split('/')[3]
                     return self.respond({'messages': app.store.messages(sid, int(query.get('before', ['0'])[0]), int(query.get('limit', ['50'])[0]))})
-            assets = {'/': 'index.html', '/app.js': 'app.js', '/style.css': 'style.css', '/manifest.webmanifest': 'manifest.webmanifest', '/icon.svg': 'icon.svg', '/icon-192.png': 'icon-192.png', '/icon-512.png': 'icon-512.png'}
+            assets = {'/': 'index.html', '/app.js': 'app.js', '/theme-init.js': 'theme-init.js', '/style.css': 'style.css', '/manifest.webmanifest': 'manifest.webmanifest', '/icon.svg': 'icon.svg', '/icon-192.png': 'icon-192.png', '/icon-512.png': 'icon-512.png'}
             if path in assets:
                 target = STATIC / assets[path]
                 return self.respond(target.read_bytes(), content_type=mimetypes.guess_type(target.name)[0] or 'application/octet-stream')
@@ -230,6 +262,44 @@ class Handler(BaseHTTPRequestHandler):
                 return self.respond(app.start(data.get('prompt'), data.get('session_id')), 202)
             if app.busy:
                 raise ValueError('cannot change workspace/session while a task is running')
+            if path == '/api/workspaces':
+                name = data.get('name')
+                if not isinstance(name, str) or len(name) > 100:
+                    raise ValueError('invalid workspace name')
+                set_active_workspace(name)
+                app.reload()
+                return self.respond(app.status())
+            if path == '/api/workspaces/clone':
+                target = clone_workspace(data.get('url'), data.get('name'))
+                return self.respond({'path': str(target)}, 201)
+            if path == '/api/workspaces/remove':
+                name = data.get('name')
+                if data.get('confirm_workspace') != name or data.get('mode') not in {'archive', 'delete'}:
+                    raise ValueError('type the workspace name to confirm archive or deletion')
+                remove_workspace(name, archive=data['mode'] == 'archive')
+                return self.respond({'removed': name, 'mode': data['mode']})
+            if path == '/api/models':
+                model = data.get('model')
+                if model not in asyncio.run(app.models()):
+                    raise ValueError('model not offered by the current bridge')
+                set_model(model)
+                app.reload()
+                return self.respond(app.status())
+            if path == '/api/file/preview' or path == '/api/file/save':
+                with app.store.execution_lock():
+                    return self.respond(save_text(app.settings.workspace, data.get('path'), data.get('content'),
+                                                  data.get('sha256'), preview=path.endswith('/preview')))
+            if path == '/api/file/action':
+                if data.get('action') == 'delete' and data.get('confirm') is not True:
+                    raise ValueError('explicit deletion confirmation required')
+                with app.store.execution_lock():
+                    file_action(app.settings.workspace, data.get('action'), data.get('path'), data.get('name', ''))
+                return self.respond({'ok': True})
+            if path == '/api/git':
+                if data.get('action') == 'commit' and data.get('confirm') is not True:
+                    raise ValueError('explicit commit confirmation required')
+                with app.store.execution_lock():
+                    return self.respond(git(app.settings.workspace, data.get('action'), data.get('value', '')))
             with app.store.execution_lock():
                 if path == '/api/sessions':
                     app.session = app.store.create(data.get('title', 'New session'))['id']
@@ -242,14 +312,13 @@ class Handler(BaseHTTPRequestHandler):
                 elif path == '/api/sessions/delete':
                     if data.get('confirm') is not True:
                         raise ValueError('explicit confirmation required')
-                    app.store.delete(data.get('session_id'))
-                    app.session = app.store.current()['id']
-                elif path == '/api/workspaces':
-                    name = data.get('name')
-                    if not isinstance(name, str) or len(name) > 100:
-                        raise ValueError('invalid workspace name')
-                    set_active_workspace(name)
-                    app.reload()
+                    app.session = app.store.delete(data.get('session_id'))['id']
+                elif path == '/api/sessions/clear-all':
+                    if data.get('confirm_workspace') != app.settings.active_workspace:
+                        raise ValueError('type the current workspace name to confirm')
+                    result = app.store.clear_all()
+                    app.session = result['session']['id']
+                    return self.respond({**app.status(), **result})
                 else:
                     return self.respond({'error': {'message': 'Not found'}}, 404)
             return self.respond(app.status())

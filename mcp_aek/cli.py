@@ -6,7 +6,7 @@ import json
 import sys
 
 from .agent import AEKAgent
-from .config import Settings, list_workspaces, set_active_workspace
+from .config import Settings, list_workspaces, set_active_workspace, clone_workspace
 from .sessions import SessionStore, sanitize
 
 
@@ -90,6 +90,9 @@ def _workspace_command(args: argparse.Namespace) -> int:
             "shell_enabled": s.enable_shell,
         }, ensure_ascii=False, indent=2))
         return 0
+    if args.workspace_action == "clone":
+        print(f"cloned: {clone_workspace(args.url, args.name)}")
+        return 0
     raise RuntimeError("unknown workspace action")
 
 
@@ -108,7 +111,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     chat = sub.add_parser("chat", help="persistent workspace chat and sessions")
-    chat.add_argument("action", nargs="?", choices=["new", "list", "use", "rename", "info", "delete", "summary"])
+    chat.add_argument("action", nargs="?", choices=["new", "list", "use", "rename", "info", "delete", "summary", "clear-all"])
     chat.add_argument("value", nargs="?")
     chat.add_argument("--yes", action="store_true", help="confirm session deletion")
     ui = sub.add_parser("ui", help="start the local mobile chat UI")
@@ -128,6 +131,9 @@ def build_parser() -> argparse.ArgumentParser:
     ws_create.add_argument("name")
     ws_use = ws_sub.add_parser("use")
     ws_use.add_argument("name")
+    ws_clone = ws_sub.add_parser("clone")
+    ws_clone.add_argument("url")
+    ws_clone.add_argument("name")
 
     serve = sub.add_parser("serve", help="run the MCP server manually")
     serve.add_argument("--http", action="store_true")
@@ -140,14 +146,23 @@ def build_parser() -> argparse.ArgumentParser:
 def _session_command(args):
     settings = Settings.load()
     store = SessionStore(settings.workspace, (settings.upstream_api_key,))
+    if args.action in ('use', 'rename', 'summary', 'delete') and not args.value:
+        print(f'chat {args.action} requires a value', file=sys.stderr)
+        return 2
+    if args.action in ('delete', 'clear-all') and not args.yes:
+        print('Deletion requires --yes; history will be permanently removed.', file=sys.stderr)
+        return 2
+    if args.action == 'list':
+        active = store.current_id()
+        for item in store.list():
+            print(f"{'*' if item['id'] == active else ' '} {item['id']}  {item['title']}  {item['message_count']} messages  {item['updated_at']}")
+        return 0
+    if args.action == 'info' and store.current_id():
+        print(json.dumps(store.current(), ensure_ascii=False, indent=2))
+        return 0
     with store.execution_lock():
         if args.action == 'new':
             result = store.create(args.value or 'New session')
-        elif args.action == 'list':
-            active = store.current()['id']
-            for item in store.list():
-                print(f"{'*' if item['id'] == active else ' '} {item['id']}  {item['title']}  {item['message_count']} messages  {item['updated_at']}")
-            return 0
         elif args.action == 'info':
             result = store.current()
         elif args.action == 'use':
@@ -158,11 +173,11 @@ def _session_command(args):
             store.set_summary(store.current()['id'], args.value)
             result = store.current()
         elif args.action == 'delete':
-            if not args.yes:
-                print('Deletion requires --yes; history will be permanently removed.', file=sys.stderr)
-                return 2
-            store.delete(args.value)
-            result = {'deleted': args.value}
+            deleted = store.resolve(args.value)
+            store.delete(deleted)
+            result = {'deleted': deleted}
+        elif args.action == 'clear-all':
+            result = store.clear_all()
         print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
 

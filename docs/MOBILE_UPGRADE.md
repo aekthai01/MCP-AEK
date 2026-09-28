@@ -112,3 +112,44 @@ manual checks above. Existing CI runs Python 3.12.
 - `git diff --check`: passed. Existing bridge patch/workflow diff: empty.
 - The negative tool traversal test intentionally emits an MCP exception on stderr;
   it verifies `tool_failed`, durable error output, and normalized call IDs.
+
+## v0.3 branch changes and device checks
+
+The UI now supports per-session actions, workspace-scoped clear-all, dark/light/system
+themes, workspace creation/selection/clone/archive/delete, bounded file browsing and
+text editing with diff preview, Git status/diff/staging/commits/branches, artifact
+discovery/download, and runtime model selection from the bridge's `/v1/models`.
+The UI still runs only on loopback. Clone accepts public HTTPS URLs on supported hosts;
+credential-bearing URLs are rejected. `AEK_MODEL` in the environment overrides UI model
+selection. Empty folders may be deleted; files and folders inside `.aek`/`.git` are
+inaccessible from the file UI.
+
+Task queuing and real cancellation remain unimplemented. An active task holds the
+workspace execution lock from request reservation through completion. The UI blocks
+new tasks while one runs. Artifact origins are not recorded; detection is based on
+file extensions and reports path, size and modification time. It scans at most 5000
+files and shows the newest 100 matches. Workspace size excludes `.git` and `.aek`.
+Push, tag, release and automatic merge are not exposed in the UI.
+
+On Termux, update the feature branch, reinstall, and check:
+
+```bash
+cd ~/MCP-AEK
+git fetch origin
+git switch feat/persistent-mobile-chat
+git pull --ff-only origin feat/persistent-mobile-chat
+.venv/bin/pip install -e .
+./aek doctor
+./aek run "ตอบ OK เท่านั้น"
+./aek chat
+./aek ui
+```
+
+In the browser: delete a non-active and active session, clear the current workspace
+after typing its name, switch all three themes, create/switch workspace and clone a
+public repository, browse/edit a text file and review its diff, inspect Git status
+and diff, and inspect tool activity. Reload and restart the backend, then verify
+session persistence, theme persistence and workspace isolation. Check keyboard,
+portrait/landscape and PWA behavior on the phone. Confirm no credentials appear
+in diagnostics or clone errors. Python 3.14/Android and the patched bridge need
+this real-device check; Linux tests cannot establish them.

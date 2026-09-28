@@ -41,6 +41,27 @@ class SessionTests(unittest.TestCase):
         with self.assertRaises(ValueError):separate.info(self.sid)
         self.store.delete(self.sid);self.assertNotEqual(self.store.current()['id'],self.sid)
         self.assertEqual(self.store.info(other)['title'],'web-ui')
+    def test_delete_and_clear_are_atomic_and_workspace_scoped(self):
+        other = self.store.create('other')['id']
+        self.store.append(other, {'role':'user','content':'keep until clear'})
+        self.store.delete(self.sid)
+        self.assertEqual(self.store.current()['id'], other)
+        separate = SessionStore(self.root/'separate')
+        separate_id = separate.current()['id']
+        self.store.delete(other)
+        self.assertNotEqual(self.store.current()['id'], other)
+        self.store.append(self.store.current()['id'], {'role':'user','content':'delete'})
+        with self.store.connect() as db:
+            db.execute("CREATE TRIGGER reject_clear BEFORE DELETE ON sessions BEGIN SELECT RAISE(ABORT, 'blocked'); END")
+        with self.assertRaises(sqlite3.DatabaseError):
+            self.store.clear_all()
+        self.assertEqual(len(self.store.list()), 1)
+        self.assertEqual(self.store.current()['message_count'], 1)
+        with self.store.connect() as db: db.execute('DROP TRIGGER reject_clear')
+        result = self.store.clear_all()
+        self.assertEqual(result['deleted_messages'], 1)
+        self.assertEqual(self.store.current()['message_count'], 0)
+        self.assertEqual(separate.current()['id'], separate_id)
     def test_corruption_does_not_silently_reset(self):
         self.store.path.write_bytes(b'not sqlite')
         with self.assertRaises(sqlite3.DatabaseError):SessionStore(self.root)

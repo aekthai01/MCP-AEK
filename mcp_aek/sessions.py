@@ -117,6 +117,11 @@ class SessionStore:
             row = db.execute("SELECT value FROM state WHERE key='current'").fetchone()
         return self.info(row[0]) if row else self.create()
 
+    def current_id(self):
+        with self.connect() as db:
+            row = db.execute("SELECT value FROM state WHERE key='current'").fetchone()
+        return row[0] if row else None
+
     def use(self, ref):
         sid = self.resolve(ref)
         with self.connect() as db:
@@ -140,7 +145,26 @@ class SessionStore:
         sid = self.resolve(ref)
         with self.connect() as db:
             db.execute('DELETE FROM sessions WHERE id=?', (sid,))
-            db.execute("DELETE FROM state WHERE key='current' AND value=?", (sid,))
+            active = db.execute("SELECT value FROM state WHERE key='current'").fetchone()
+            if active and active[0] == sid:
+                next_row = db.execute('SELECT id FROM sessions ORDER BY updated_at DESC LIMIT 1').fetchone()
+                next_id = next_row[0] if next_row else uuid.uuid4().hex
+                if not next_row:
+                    now = datetime.now(timezone.utc).isoformat()
+                    db.execute('INSERT INTO sessions(id,title,created_at,updated_at) VALUES(?,?,?,?)', (next_id, 'New session', now, now))
+                db.execute("INSERT OR REPLACE INTO state VALUES('current',?)", (next_id,))
+        return self.current()
+
+    def clear_all(self):
+        """Replace this workspace's history in one SQLite transaction."""
+        sid, now = uuid.uuid4().hex, datetime.now(timezone.utc).isoformat()
+        with self.connect() as db:
+            counts = db.execute('SELECT (SELECT count(*) FROM sessions), (SELECT count(*) FROM messages)').fetchone()
+            db.execute('DELETE FROM messages')
+            db.execute('DELETE FROM sessions')
+            db.execute('INSERT INTO sessions(id,title,created_at,updated_at) VALUES(?,?,?,?)', (sid, 'New session', now, now))
+            db.execute("INSERT OR REPLACE INTO state VALUES('current',?)", (sid,))
+        return {'deleted_sessions': counts[0], 'deleted_messages': counts[1], 'session': self.info(sid)}
 
     def append(self, sid, message):
         sid = self.resolve(sid)

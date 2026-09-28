@@ -78,6 +78,58 @@ class IntegrationTests(unittest.TestCase):
             with self.assertRaises(HTTPError):self.get('/api/chat',raw=raw)
         with self.assertRaises(HTTPError):self.get('/api/sessions/delete',{'session_id':a})
         self.get('/api/sessions/delete',{'session_id':a,'confirm':True})
+    def test_clear_all_confirmation_isolation_and_busy_lock(self):
+        sid=self.app.session
+        self.app.store.append(sid,{'role':'user','content':'secret history'})
+        self.get('/api/workspaces',{'name':'second'})
+        second=self.app.session
+        self.get('/api/workspaces',{'name':'default'})
+        with self.assertRaises(HTTPError):self.get('/api/sessions/clear-all',{'confirm_workspace':'second'})
+        self.app.busy=True
+        try:
+            with self.assertRaises(HTTPError):self.get('/api/sessions/clear-all',{'confirm_workspace':'default'})
+        finally:self.app.busy=False
+        result=self.get('/api/sessions/clear-all',{'confirm_workspace':'default'})
+        self.assertEqual(result['deleted_messages'],1)
+        self.assertNotEqual(result['session']['id'],sid)
+        self.get('/api/workspaces',{'name':'second'})
+        self.assertEqual(self.app.session,second)
+    def test_workspace_archive_delete_and_clone_url_validation(self):
+        from mcp_aek.config import clone_workspace
+        self.get('/api/workspaces',{'name':'second'})
+        self.get('/api/workspaces',{'name':'default'})
+        for url in ('https://user:pass@github.com/owner/repo', 'https://example.com/owner/repo', 'file:///tmp/repo'):
+            with self.assertRaises(ValueError):clone_workspace(url,'unsafe')
+        with self.assertRaises(HTTPError):self.get('/api/workspaces/remove',{'name':'second','mode':'delete'})
+        self.get('/api/workspaces/remove',{'name':'second','mode':'archive','confirm_workspace':'second'})
+        self.assertNotIn('second',[w['name'] for w in self.get('/api/workspaces')['workspaces']])
+        self.assertTrue((self.root/'workspaces/.archived/second').is_dir())
+        self.get('/api/workspaces',{'name':'third'})
+        self.get('/api/workspaces',{'name':'default'})
+        self.get('/api/workspaces/remove',{'name':'third','mode':'delete','confirm_workspace':'third'})
+        self.assertFalse((self.root/'workspaces/third').exists())
+    def test_model_selection_persists_and_respects_env_override(self):
+        from mcp_aek.config import set_model
+        with patch.dict(os.environ,{'AEK_MODEL':''}):
+            set_model('test-model')
+            self.assertEqual(config.Settings.load().model,'test-model')
+        with patch.dict(os.environ,{'AEK_MODEL':'pinned-model'}):
+            with self.assertRaises(ValueError):set_model('other')
+            self.assertEqual(config.Settings.load().model,'pinned-model')
+    def test_file_git_api(self):
+        file=self.app.settings.workspace/'example.txt'
+        file.write_text('original\n')
+        page=self.get('/api/files')
+        self.assertTrue(any(e['name']=='example.txt' for e in page['entries']))
+        info=self.get('/api/file?path=example.txt')
+        self.assertEqual(info['text'],'original\n')
+        with self.assertRaises(HTTPError):self.get('/api/file?path=../state/state.json')
+        preview=self.get('/api/file/preview',{'path':'example.txt','content':'replaced\n','sha256':info['sha256']})
+        self.assertIn('+replaced',preview['diff'])
+        self.assertEqual(file.read_text(),'original\n')
+        self.get('/api/file/save',{'path':'example.txt','content':'replaced\n','sha256':info['sha256']})
+        with self.assertRaises(HTTPError):self.get('/api/file/save',{'path':'example.txt','content':'stale','sha256':info['sha256']})
+        with self.assertRaises(HTTPError):self.get('/api/git')
     def test_origin_host_csrf_and_traversal(self):
         for headers in [{'Origin':'https://evil.example'},{'Host':'evil.example'},{'Sec-Fetch-Site':'cross-site'}]:
             with self.assertRaises(HTTPError) as cm:self.get('/api/status',headers=headers)
@@ -92,6 +144,18 @@ class IntegrationTests(unittest.TestCase):
         self.get('/api/chat',{'prompt':'fail','session_id':self.app.session});self.wait()
         self.assertIn('error',[e['type'] for e in self.app.events])
         self.assertEqual(self.app.store.messages(self.app.session)[0]['message']['content'],'fail')
+    def test_ui_reserves_execution_lock_before_worker_runs(self):
+        gate=threading.Event()
+        original=FakeUpstreamAgent._completion
+        async def delayed(agent,messages,tools):
+            await asyncio.to_thread(gate.wait, 3)
+            return await original(agent,messages,tools)
+        with patch.object(FakeUpstreamAgent,'_completion',delayed):
+            self.app.start('reserve',self.app.session)
+            with self.assertRaises(ValueError):
+                with SessionStore(self.app.settings.workspace).execution_lock():pass
+            gate.set()
+            self.wait()
     def test_doctor_real_mcp_and_failed_upstream(self):
         data=self.get('/api/diagnostics')
         self.assertTrue(data['mcp_ok']);self.assertFalse(data['upstream_ok']);self.assertEqual(data['tool_count'],13)
