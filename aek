@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$ROOT"
+if [[ ! -x .venv/bin/aek ]]; then
+  echo 'MCP-AEK is not installed yet. Run: bash scripts/install-termux.sh' >&2
+  exit 1
+fi
+exec .venv/bin/aek "$@"
