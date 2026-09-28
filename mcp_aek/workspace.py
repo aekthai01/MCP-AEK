@@ -98,9 +98,7 @@ def git(root: Path, action: str, value: str = '') -> dict:
     if action in reads:
         args = reads[action]
     elif action in {'stage', 'unstage'}:
-        path = safe_path(root, value)
-        if not path.exists():
-            raise ValueError('file does not exist')
+        safe_path(root, value)  # Lexical/symlink boundary check; tracked deletions need not exist.
         if action == 'stage':
             args = ['add', '--', value]
         elif subprocess.run(['git', 'rev-parse', '--verify', 'HEAD'], cwd=root,

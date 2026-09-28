@@ -30,6 +30,29 @@ class SessionTests(unittest.TestCase):
         subprocess.run([sys.executable,'-c',code,str(self.store.path),self.sid],check=True)
         self.assertEqual(SessionStore(self.root).messages(self.sid)[0]['message']['content'],'บันทึกแล้ว')
         self.assertEqual(self.store.current()['message_count'],1)
+    def test_enqueued_prompt_survives_process_restart(self):
+        code=("from pathlib import Path; from mcp_aek.sessions import SessionStore; import sys,os; "
+              "s=SessionStore(Path(sys.argv[1])); sid=s.current()['id']; s.enqueue(sid,'queued-before-crash'); os._exit(0)")
+        subprocess.run([sys.executable,'-c',code,str(self.root)],check=True)
+        reopened=SessionStore(self.root)
+        messages=[m['message'] for m in reopened.messages(self.sid)]
+        self.assertEqual([m.get('content') for m in messages if m.get('role')=='user'].count('queued-before-crash'),1)
+        task=next(t for t in reopened.tasks() if t['prompt']=='queued-before-crash')
+        self.assertEqual(task['status'],'queued');self.assertIsNotNone(task['message_seq'])
+        reopened.recover_tasks()
+        task=next(t for t in reopened.tasks() if t['id']==task['id'])
+        self.assertEqual(task['status'],'failed')
+        self.assertEqual([m['message'].get('content') for m in reopened.messages(self.sid)].count('queued-before-crash'),1)
+
+    def test_task_history_excludes_future_prompts_and_restores_logical_order(self):
+        first=self.store.enqueue(self.sid,'first')
+        second=self.store.enqueue(self.sid,'second')
+        self.store.append(self.sid,{'role':'assistant','content':'first answer'},task_id=first)
+        first_history=self.store.history_for_task(self.sid,first,60000)
+        self.assertEqual([m.get('content') for m in first_history],['first','first answer'])
+        second_history=self.store.history_for_task(self.sid,second,60000)
+        self.assertEqual([m.get('content') for m in second_history],['first','first answer','second'])
+
     def test_management_isolation_and_pagination(self):
         self.store.rename(self.sid,'luas'); other=self.store.create('web-ui')['id']
         self.store.use('luas');self.assertEqual(self.store.current()['id'],self.sid)

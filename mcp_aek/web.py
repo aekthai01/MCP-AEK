@@ -68,14 +68,12 @@ class App:
         if not isinstance(prompt, str) or not prompt.strip() or len(prompt.encode()) > 48000:
             raise ValueError('prompt must contain 1–48000 UTF-8 bytes')
         with self.lock:
+            if session_id != self.session:
+                raise ValueError('active session changed; reload before sending')
             if self.busy:
-                if session_id != self.session:
-                    raise ValueError('active session changed; reload before sending')
                 task_id = self.store.enqueue(self.session, prompt)
                 self.emit({'type': 'task_queued', 'task_id': task_id})
                 return {'request_id': task_id, 'queued': True}
-            if session_id != self.session:
-                raise ValueError('active session changed; reload before sending')
             reservation = self.store.execution_lock()
             reservation.__enter__()
             try:
@@ -103,14 +101,17 @@ class App:
                         released = True
                         return
                     self.request_id = task['id']
+
                 async def run():
                     agent = self.agent_factory(self.settings)
                     try:
-                        self.store.append(task['session'], {"role": "user", "content": task['prompt']})
-                        history = await asyncio.to_thread(self.store.history, task['session'], self.settings.context_bytes)
-                        await agent.run(task['prompt'], history, store=self.store, session_id=task['session'], emit=self.emit, recorded=True)
+                        history = await asyncio.to_thread(
+                            self.store.history_for_task, task['session'], task['id'], self.settings.context_bytes)
+                        await agent.run(task['prompt'], history, store=self.store, session_id=task['session'],
+                                        emit=self.emit, recorded=True, task_id=task['id'])
                     finally:
                         await agent.close()
+
                 error = None
                 try:
                     asyncio.run(run())
@@ -118,7 +119,15 @@ class App:
                     error = f'{type(exc).__name__}: {exc}'
                     self.emit({'type': 'error', 'message': error})
                 self.store.finish_task(task['id'], error)
-                self.emit({'type': 'request_finished'})
+                with self.lock:
+                    queue_pending = self.store.has_queued_tasks()
+                    if not queue_pending:
+                        reservation.__exit__(None, None, None)
+                        self.busy = False
+                        released = True
+                    self.emit({'type': 'request_finished', 'queue_pending': queue_pending})
+                if not queue_pending:
+                    return
         finally:
             if not released:
                 with self.lock:
@@ -336,7 +345,7 @@ class Handler(BaseHTTPRequestHandler):
                 elif path == '/api/sessions/use':
                     app.session = app.store.use(data.get('session_id'))['id']
                 elif path == '/api/sessions/rename':
-                    app.store.rename(app.session, data.get('title'))
+                    app.store.rename(data.get('session_id') or app.session, data.get('title'))
                 elif path == '/api/sessions/summary':
                     app.store.set_summary(app.session, data.get('summary'))
                 elif path == '/api/sessions/delete':

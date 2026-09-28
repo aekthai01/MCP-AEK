@@ -139,7 +139,7 @@ class AEKAgent:
             raise RuntimeError("upstream choice has no message object")
         return message
 
-    async def run(self, prompt: str, history: list[dict[str, Any]] | None = None, *, store=None, session_id=None, emit=None, recorded=False) -> tuple[str, list[dict[str, Any]]]:
+    async def run(self, prompt: str, history: list[dict[str, Any]] | None = None, *, store=None, session_id=None, emit=None, recorded=False, task_id=None) -> tuple[str, list[dict[str, Any]]]:
         messages = list(history or [])
         async def event(kind, **data):
             if emit:
@@ -148,7 +148,7 @@ class AEKAgent:
         async def record(message):
             messages.append(message)
             if store:
-                await asyncio.to_thread(store.append, session_id, message)
+                await asyncio.to_thread(store.append, session_id, message, task_id)
 
         if not recorded:
             await record({"role": "user", "content": prompt})

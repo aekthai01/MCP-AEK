@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import subprocess
 import tempfile
 import threading
 import time
@@ -184,6 +185,72 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(tasks[last['request_id']]['status'],'completed')
         prompts=[m['message']['content'] for m in self.app.store.messages(self.app.session) if m['message']['role']=='user']
         self.assertEqual(prompts,['first','fail','last'])
+    def test_queue_ack_is_durable_associated_and_not_duplicated(self):
+        gate=threading.Event()
+        original=FakeUpstreamAgent._completion
+        async def delayed(agent,messages,tools):
+            if messages[-1].get('content')=='first-ack':
+                await asyncio.to_thread(gate.wait,3)
+            return await original(agent,messages,tools)
+        with patch.object(FakeUpstreamAgent,'_completion',delayed):
+            first=self.app.start('first-ack',self.app.session)
+            queued=self.app.start('queued-ack',self.app.session)
+            self.assertTrue(queued['queued'])
+            immediate=[m['message']['content'] for m in self.app.store.messages(self.app.session) if m['message']['role']=='user']
+            self.assertEqual(immediate,['first-ack','queued-ack'])
+            queued_task=next(t for t in self.app.store.tasks() if t['id']==queued['request_id'])
+            self.assertIsNotNone(queued_task['message_seq'])
+            gate.set();self.wait()
+        prompts=[m['message']['content'] for m in self.app.store.messages(self.app.session) if m['message']['role']=='user']
+        self.assertEqual(prompts.count('first-ack'),1)
+        self.assertEqual(prompts.count('queued-ack'),1)
+        tasks={t['id']:t for t in self.get('/api/tasks')['tasks']}
+        for task_id in (first['request_id'],queued['request_id']):
+            task=tasks[task_id]
+            self.assertEqual(task['status'],'completed')
+            self.assertEqual(task['workspace'],str(self.app.settings.workspace))
+            self.assertEqual(task['session'],self.app.session)
+            self.assertIsNotNone(task['started_at']);self.assertIsNotNone(task['finished_at'])
+            self.assertIsNotNone(task['duration_ms'])
+
+    def test_non_active_session_rename_does_not_change_active(self):
+        first=self.app.session
+        second=self.get('/api/sessions',{'title':'Second'})['session']['id']
+        self.assertEqual(self.app.session,second)
+        self.get('/api/sessions/rename',{'session_id':first,'title':'First renamed'})
+        self.assertEqual(self.app.session,second)
+        data=self.get('/api/sessions')
+        self.assertEqual(data['active'],second)
+        self.assertEqual(next(s['title'] for s in data['sessions'] if s['id']==first),'First renamed')
+
+    def test_workspace_details_does_not_create_session_metadata(self):
+        fresh=self.root/'workspaces/fresh-git';fresh.mkdir()
+        subprocess.run(['git','init','-q',str(fresh)],check=True)
+        self.assertFalse((fresh/'.aek').exists())
+        rows=self.get('/api/workspaces')['workspaces']
+        row=next(item for item in rows if item['name']=='fresh-git')
+        self.assertTrue(row['git']);self.assertEqual(row['sessions'],0)
+        self.assertFalse((fresh/'.aek').exists())
+        self.assertEqual(subprocess.check_output(['git','status','--porcelain'],cwd=fresh,text=True),'')
+
+    def test_clone_cleanup_on_timeout_and_exception(self):
+        from mcp_aek.config import clone_workspace
+        def timeout_run(argv,**_kwargs):
+            Path(argv[-1]).mkdir(parents=True)
+            (Path(argv[-1])/'partial').write_text('x')
+            raise subprocess.TimeoutExpired(argv,180)
+        with patch('mcp_aek.config.subprocess.run',side_effect=timeout_run):
+            with self.assertRaisesRegex(ValueError,'timed out'):
+                clone_workspace('https://github.com/owner/repo.git','timeout-clone')
+        self.assertFalse((self.root/'workspaces/timeout-clone').exists())
+        def error_run(argv,**_kwargs):
+            Path(argv[-1]).mkdir(parents=True)
+            raise OSError('git unavailable')
+        with patch('mcp_aek.config.subprocess.run',side_effect=error_run):
+            with self.assertRaisesRegex(ValueError,'OSError'):
+                clone_workspace('https://github.com/owner/repo.git','error-clone')
+        self.assertFalse((self.root/'workspaces/error-clone').exists())
+
     def test_doctor_real_mcp_and_failed_upstream(self):
         data=self.get('/api/diagnostics')
         self.assertTrue(data['mcp_ok']);self.assertFalse(data['upstream_ok']);self.assertEqual(data['tool_count'],13)

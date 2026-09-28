@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 
 from mcp_aek.workspace import list_files, inspect_file, save_text, git, file_action, artifacts
+from mcp_aek.sessions import SessionStore
 
 
 class WorkspaceTests(unittest.TestCase):
@@ -39,9 +40,27 @@ class WorkspaceTests(unittest.TestCase):
         self.assertTrue(git(self.root, 'stage', 'readme.txt')['ok'])
         self.assertTrue(git(self.root, 'commit', 'first commit')['ok'])
         self.assertIn('first commit', git(self.root, 'log')['output'])
+        (self.root / 'readme.txt').unlink()
+        self.assertTrue(git(self.root, 'stage', 'readme.txt')['ok'])
+        self.assertIn('-before', git(self.root, 'staged')['output'])
+        self.assertTrue(git(self.root, 'unstage', 'readme.txt')['ok'])
+        self.assertIn(' D readme.txt', git(self.root, 'status')['output'])
+        subprocess.run(['git','restore','readme.txt'],cwd=self.root,check=True)
         original = subprocess.check_output(['git', 'branch', '--show-current'], cwd=self.root, text=True).strip()
         self.assertTrue(git(self.root, 'branch', 'feature/test')['ok'])
         self.assertTrue(git(self.root, 'switch', original)['ok'])
+
+    def test_session_metadata_is_locally_excluded_from_git(self):
+        subprocess.run(['git','init','-q',str(self.root)],check=True)
+        subprocess.run(['git','config','user.name','Test'],cwd=self.root,check=True)
+        subprocess.run(['git','config','user.email','test@example.invalid'],cwd=self.root,check=True)
+        subprocess.run(['git','add','readme.txt'],cwd=self.root,check=True)
+        subprocess.run(['git','commit','-q','-m','baseline'],cwd=self.root,check=True)
+        self.assertFalse((self.root/'.gitignore').exists())
+        SessionStore(self.root).current()
+        self.assertEqual(subprocess.check_output(['git','status','--porcelain'],cwd=self.root,text=True),'')
+        self.assertFalse((self.root/'.gitignore').exists())
+        self.assertIn('/.aek/',(self.root/'.git/info/exclude').read_text())
 
     def test_file_actions_and_artifact_boundary(self):
         file_action(self.root, 'new-folder', '', 'src')

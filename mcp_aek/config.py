@@ -6,6 +6,9 @@ import tempfile
 import fcntl
 import re
 import subprocess
+import shutil
+import sqlite3
+from urllib.parse import quote
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -143,6 +146,17 @@ def list_workspaces() -> list[str]:
     return sorted(p.name for p in settings.workspace_root.iterdir() if p.is_dir() and not p.is_symlink() and not p.name.startswith('.'))
 
 
+def _cleanup_partial_workspace(target: Path) -> bool:
+    try:
+        if target.is_symlink():
+            target.unlink()
+        elif target.exists():
+            shutil.rmtree(target)
+        return True
+    except OSError:
+        return False
+
+
 def clone_workspace(url: str, name: str) -> Path:
     if not isinstance(url, str) or not re.fullmatch(r'https://[^\s]+', url):
         raise ValueError('repository URL must use HTTPS')
@@ -158,20 +172,40 @@ def clone_workspace(url: str, name: str) -> Path:
     target = settings.workspace_root / name
     if target.exists() or target.is_symlink():
         raise ValueError('workspace already exists')
-    # Destination must stay absent until git creates it; never pass input through a shell.
-    result = subprocess.run(['git', '-c', 'credential.helper=', 'clone', '--progress', '--', url, str(target)],
-                            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=180,
-                            env={**os.environ, 'GIT_TERMINAL_PROMPT': '0'})
+    try:
+        result = subprocess.run(['git', '-c', 'credential.helper=', 'clone', '--progress', '--', url, str(target)],
+                                stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=180,
+                                env={**os.environ, 'GIT_TERMINAL_PROMPT': '0'})
+    except subprocess.TimeoutExpired as exc:
+        cleaned = _cleanup_partial_workspace(target)
+        cleanup = 'partial workspace removed' if cleaned else 'partial workspace cleanup failed'
+        raise ValueError('clone timed out after 180 seconds; ' + cleanup) from exc
+    except Exception as exc:
+        cleaned = _cleanup_partial_workspace(target)
+        cleanup = 'partial workspace removed' if cleaned else 'partial workspace cleanup failed'
+        raise ValueError(f'clone failed before completion ({type(exc).__name__}); {cleanup}') from exc
     if result.returncode:
-        import shutil
-        if target.exists():
-            shutil.rmtree(target)
-        raise ValueError('clone failed; verify repository URL and connectivity')
+        cleaned = _cleanup_partial_workspace(target)
+        cleanup = 'partial workspace removed' if cleaned else 'partial workspace cleanup failed'
+        raise ValueError(f'clone failed with exit code {result.returncode}; verify repository URL and connectivity; {cleanup}')
     return target
 
 
+def _session_count_read_only(path: Path) -> int:
+    root = path / '.aek'
+    database = root / 'sessions.sqlite3'
+    if root.is_symlink() or database.is_symlink() or not database.is_file():
+        return 0
+    uri = 'file:' + quote(str(database), safe='/') + '?mode=ro'
+    try:
+        with sqlite3.connect(uri, uri=True, timeout=1) as db:
+            row = db.execute('SELECT count(*) FROM sessions').fetchone()
+            return int(row[0]) if row else 0
+    except (sqlite3.Error, OSError):
+        return 0
+
+
 def workspace_details() -> list[dict]:
-    from .sessions import SessionStore
     settings = Settings.load()
     result = []
     for name in list_workspaces():
@@ -187,12 +221,13 @@ def workspace_details() -> list[dict]:
                     break
                 p = Path(base) / file
                 if not p.is_symlink():
-                    try: size += p.stat().st_size
-                    except OSError: pass
+                    try:
+                        size += p.stat().st_size
+                    except OSError:
+                        pass
         result.append({'name': name, 'path': str(path), 'size': size, 'last_activity': path.stat().st_mtime,
-                       'git': (path / '.git').is_dir(), 'sessions': len(SessionStore(path).list())})
+                       'git': (path / '.git').exists(), 'sessions': _session_count_read_only(path)})
     return result
-
 
 def set_model(model: str) -> None:
     if not isinstance(model, str) or not model or len(model) > 120:

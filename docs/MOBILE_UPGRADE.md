@@ -127,14 +127,22 @@ selection. Empty folders may be deleted; files and folders inside `.aek`/`.git` 
 inaccessible from the file UI.
 
 Task queuing is workspace-local and serialized, with durable queued/running/completed/
-failed status and IDs in SQLite. A failed task does not stop subsequent tasks. After
-an interrupted backend restart, unfinished tasks are marked failed; they are not
-silently replayed. Real cancellation remains unimplemented. An active worker holds the
-workspace execution lock from request reservation through the queue drain. Session
-and workspace mutations are blocked while tasks remain. Artifact origins are not recorded; detection is based on
-file extensions and reports path, size and modification time. It scans at most 5000
-files and shows the newest 100 matches. Workspace size excludes `.git` and `.aek`.
-Push, tag, release and automatic merge are not exposed in the UI.
+failed status and IDs in SQLite. The user prompt and task row are committed atomically
+before `/api/chat` returns 202; task-associated messages prevent a queued prompt from
+being duplicated when its worker starts. A failed task does not stop subsequent tasks.
+After an interrupted backend restart, unfinished tasks are marked failed while their
+committed user prompts remain in history; tasks are not silently replayed. The task
+panel shows workspace/session, created/started/finished timestamps and duration. An
+active worker holds the workspace execution lock from reservation through queue drain.
+Session and workspace mutations are blocked while tasks remain.
+
+Known limitations / deferred work: real cancellation is not implemented; Git clone is
+synchronous and reports only final success/failure (streaming clone progress is deferred);
+artifact origin/task attribution is not recorded; and the proposed engineering workflow
+engine/shortcuts are deferred. Artifact discovery is extension-based and reports path,
+size and modification time, scanning at most 5000 files and showing the newest 100.
+Workspace size excludes `.git` and `.aek`. Push, tag, release and automatic merge are
+not exposed in the UI.
 
 On Termux, update the feature branch, reinstall, and check:
 
