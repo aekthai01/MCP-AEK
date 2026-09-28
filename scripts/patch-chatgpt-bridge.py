@@ -59,10 +59,27 @@ sub_once(
               }
               return null;
             }
-            function findStopBtn() {''',
+            function findSendBtn() {'''.replace('function findSendBtn() {', 'function findSendBtn() {', 1),
     "findSendBtn",
 )
 
+# Broaden stop-button detection without depending on locale-specific text only.
+sub_once(
+    r'''            function findStopBtn\(\) \{\n.*?            \}\n            function pageError\(\) \{''',
+    '''            function findStopBtn() {
+              return document.querySelector('button[data-testid="stop-button"]') ||
+                document.querySelector('button[aria-label*="Stop generating" i]') ||
+                document.querySelector('button[aria-label="Stop"]') ||
+                document.querySelector('button[aria-label*="停止"]');
+            }
+            function pageError() {''',
+    "findStopBtn",
+)
+
+# ChatGPT currently has multiple turn DOM variants. Role attributes are best when
+# present, but some clients render roleless section[data-testid^=conversation-turn-]
+# containers. The bridge resets to a fresh chat for every API request, so when role
+# metadata is absent the second/newest turn is safely the assistant fallback.
 sub_once(
     r'''            function assistantText\(\) \{\n.*?            \}\n            function assistantCount\(\) \{\n.*?            \}\n''',
     '''            function roleNodes(role) {
@@ -81,6 +98,18 @@ sub_once(
               }
               return [];
             }
+            function turnNodes() {
+              var selectors = [
+                'section[data-testid^="conversation-turn-"]',
+                'article[data-testid^="conversation-turn-"]',
+                '[data-testid^="conversation-turn-"]'
+              ];
+              for (var ti = 0; ti < selectors.length; ti++) {
+                var found = document.querySelectorAll(selectors[ti]);
+                if (found && found.length) return found;
+              }
+              return [];
+            }
             function assistantFallbackNodes() {
               var selectors = [
                 'main .markdown.prose',
@@ -93,32 +122,36 @@ sub_once(
               }
               return [];
             }
+            function nodeText(node) {
+              if (!node) return '';
+              var content = node.querySelector('.markdown') ||
+                node.querySelector('.prose') ||
+                node.querySelector('[class*="markdown"]') || node;
+              var t = content.innerText || content.textContent || '';
+              return t.split(String.fromCharCode(8203)).join('').trim();
+            }
             function assistantText() {
               var nodes = roleNodes('assistant');
-              var last = null;
-              if (nodes && nodes.length) {
-                last = nodes[nodes.length - 1];
-                var content = last.querySelector('.markdown') ||
-                  last.querySelector('.prose') ||
-                  last.querySelector('[class*="markdown"]') || last;
-                var t = content.innerText || content.textContent || '';
-                return t.split(String.fromCharCode(8203)).join('');
-              }
+              if (nodes && nodes.length) return nodeText(nodes[nodes.length - 1]);
+              var turns = turnNodes();
+              if (turns && turns.length >= 2) return nodeText(turns[turns.length - 1]);
               var fallback = assistantFallbackNodes();
               if (!fallback || !fallback.length) return '';
-              last = fallback[fallback.length - 1];
-              var ft = last.innerText || last.textContent || '';
-              return ft.split(String.fromCharCode(8203)).join('');
+              return nodeText(fallback[fallback.length - 1]);
             }
             function assistantCount() {
               var nodes = roleNodes('assistant');
               if (nodes && nodes.length) return nodes.length;
+              var turns = turnNodes();
+              if (turns && turns.length >= 2) return Math.floor(turns.length / 2);
               var fallback = assistantFallbackNodes();
               return fallback ? fallback.length : 0;
             }
             function userCount() {
               var nodes = roleNodes('user');
-              return nodes ? nodes.length : 0;
+              if (nodes && nodes.length) return nodes.length;
+              var turns = turnNodes();
+              return turns && turns.length ? Math.ceil(turns.length / 2) : 0;
             }
 ''',
     "assistant DOM",
@@ -126,20 +159,28 @@ sub_once(
 
 replace_once(
     "            var pre = assistantText();\n            var preCount = assistantCount();\n            log('pre-text-len=' + pre.length + ' pre-assistant-count=' + preCount);",
-    "            var pre = assistantText();\n            var preCount = assistantCount();\n            var preUserCount = userCount();\n            var prePath = location.pathname;\n            log('pre-text-len=' + pre.length + ' pre-assistant-count=' + preCount + ' pre-user-count=' + preUserCount + ' pre-path=' + prePath);",
+    "            var pre = assistantText();\n            var preCount = assistantCount();\n            var preUserCount = userCount();\n            var preTurnCount = turnNodes().length;\n            var prePath = location.pathname;\n            log('pre-text-len=' + pre.length + ' pre-assistant-count=' + preCount + ' pre-user-count=' + preUserCount + ' pre-turn-count=' + preTurnCount + ' pre-path=' + prePath);",
     "pre-send baseline",
 )
 
 replace_once(
     "            var accepted = false;\n            for (var wa = 0; wa < 24; wa++) {\n              var inputNow = findInput();\n              var inputNowText = inputNow ? (((inputNow.isContentEditable === true) || inputNow.tagName === 'DIV') ? (inputNow.innerText || '') : (inputNow.value || '')) : '';\n              if (findStopBtn() || assistantCount() > preCount || inputNowText.length === 0) { accepted = true; break; }\n              var acceptError = pageError();",
-    "            var accepted = false;\n            var acceptReason = '';\n            for (var wa = 0; wa < 24; wa++) {\n              var inputNow = findInput();\n              var inputNowText = inputNow ? (((inputNow.isContentEditable === true) || inputNow.tagName === 'DIV') ? (inputNow.innerText || '') : (inputNow.value || '')) : '';\n              if (findStopBtn()) { accepted = true; acceptReason = 'stop-button'; break; }\n              if (assistantCount() > preCount) { accepted = true; acceptReason = 'assistant-turn'; break; }\n              if (userCount() > preUserCount) { accepted = true; acceptReason = 'user-turn'; break; }\n              if (/^\\/c\\//.test(location.pathname) && location.pathname !== prePath) { accepted = true; acceptReason = 'conversation-route'; break; }\n              if (inputNowText.length === 0) { accepted = true; acceptReason = 'composer-cleared'; break; }\n              var acceptError = pageError();",
+    "            var accepted = false;\n            var acceptReason = '';\n            for (var wa = 0; wa < 24; wa++) {\n              var inputNow = findInput();\n              var inputNowText = inputNow ? (((inputNow.isContentEditable === true) || inputNow.tagName === 'DIV') ? (inputNow.innerText || '') : (inputNow.value || '')) : '';\n              if (findStopBtn()) { accepted = true; acceptReason = 'stop-button'; break; }\n              if (assistantCount() > preCount) { accepted = true; acceptReason = 'assistant-turn'; break; }\n              if (userCount() > preUserCount) { accepted = true; acceptReason = 'user-turn'; break; }\n              if (turnNodes().length > preTurnCount) { accepted = true; acceptReason = 'conversation-turn'; break; }\n              if (/^\\/c\\//.test(location.pathname) && location.pathname !== prePath) { accepted = true; acceptReason = 'conversation-route'; break; }\n              if (inputNowText.length === 0) { accepted = true; acceptReason = 'composer-cleared'; break; }\n              var acceptError = pageError();",
     "send acceptance",
 )
 
 replace_once(
     "            if (!accepted) {\n              AndroidBridge.onError(0, '点击发送后 12 秒页面仍无响应，请打开账号页检查验证状态');\n              return;\n            }\n            var lastText = pre;",
-    "            if (!accepted) {\n              AndroidBridge.onError(0, '点击发送后 12 秒页面仍无响应，请打开账号页检查验证状态');\n              return;\n            }\n            log('send-accepted-by=' + acceptReason + ' path=' + location.pathname + ' users=' + userCount() + ' assistants=' + assistantCount());\n            var lastText = pre;",
+    "            if (!accepted) {\n              AndroidBridge.onError(0, '点击发送后 12 秒页面仍无响应，请打开账号页检查验证状态');\n              return;\n            }\n            log('send-accepted-by=' + acceptReason + ' path=' + location.pathname + ' users=' + userCount() + ' assistants=' + assistantCount() + ' turns=' + turnNodes().length);\n            var lastText = pre;",
     "acceptance logging",
+)
+
+# Include roleless turn count in the polling log so a future failure is diagnosable
+# without another APK iteration.
+replace_once(
+    "                log('loop#' + loopCnt + ' textLen=' + cur.length + ' nodes=' + nodeCount + '/' + preCount + ' stop=' + (stopNow ? 'Y' : 'N') + ' sendBtn=' + (dbgBtn ? (dbgBtn.disabled ? 'disabled' : 'ok') : 'missing') + ' stable=' + stableCnt + ' new=' + (newReply ? 'Y' : 'N'));",
+    "                log('loop#' + loopCnt + ' textLen=' + cur.length + ' nodes=' + nodeCount + '/' + preCount + ' turns=' + turnNodes().length + '/' + preTurnCount + ' stop=' + (stopNow ? 'Y' : 'N') + ' sendBtn=' + (dbgBtn ? (dbgBtn.disabled ? 'disabled' : 'ok') : 'missing') + ' stable=' + stableCnt + ' new=' + (newReply ? 'Y' : 'N'));",
+    "poll diagnostics",
 )
 
 sub_once(
@@ -158,16 +199,21 @@ sub_once(
   if (!nodes.length) nodes = document.querySelectorAll('article[data-turn="assistant"]');
   if (!nodes.length) nodes = document.querySelectorAll('[data-testid^="conversation-turn-"][data-turn="assistant"]');
   if (!nodes.length) nodes = document.querySelectorAll('[data-message-author-role="assistant"]');
+  var turns = document.querySelectorAll('section[data-testid^="conversation-turn-"]');
+  if (!turns.length) turns = document.querySelectorAll('article[data-testid^="conversation-turn-"]');
+  if (!turns.length) turns = document.querySelectorAll('[data-testid^="conversation-turn-"]');
   var markdownNodes = document.querySelectorAll('main .markdown.prose, main [class*="markdown"][class*="prose"]');
-  r.assistantCount = nodes.length || markdownNodes.length;
-  var lastAssistant = nodes.length ? nodes[nodes.length - 1] : (markdownNodes.length ? markdownNodes[markdownNodes.length - 1] : null);
+  var rolelessAssistant = (!nodes.length && turns.length >= 2) ? turns[turns.length - 1] : null;
+  r.assistantCount = nodes.length || (turns.length >= 2 ? Math.floor(turns.length / 2) : markdownNodes.length);
+  var lastAssistant = nodes.length ? nodes[nodes.length - 1] : (rolelessAssistant || (markdownNodes.length ? markdownNodes[markdownNodes.length - 1] : null));
   r.lastAssistant = lastAssistant ? String(lastAssistant.innerText || lastAssistant.textContent || '').slice(0, 300) : '';
   var userNodes = document.querySelectorAll('section[data-turn="user"]');
   if (!userNodes.length) userNodes = document.querySelectorAll('article[data-turn="user"]');
   if (!userNodes.length) userNodes = document.querySelectorAll('[data-testid^="conversation-turn-"][data-turn="user"]');
   if (!userNodes.length) userNodes = document.querySelectorAll('[data-message-author-role="user"]');
-  r.userCount = userNodes.length;
-  r.conversationTurnCount = document.querySelectorAll('[data-testid^="conversation-turn-"]').length;
+  r.userCount = userNodes.length || (turns.length ? Math.ceil(turns.length / 2) : 0);
+  r.conversationTurnCount = turns.length;
+  r.streamingStatusCount = document.querySelectorAll('[data-streaming-response-status]').length;
 ''',
     "diag turn selectors",
 )
@@ -182,6 +228,25 @@ sub_once(
     document.querySelector('button.composer-submit-btn');''',
     "diag send button",
 )
+
+# Keep a body tail snapshot for post-failure proof without exposing cookies/tokens.
+replace_once(
+    "try { r.bodyHead = document.body ? document.body.innerText.slice(0, 400) : ''; } catch(e) {}",
+    "try { var bt = document.body ? document.body.innerText : ''; r.bodyHead = bt.slice(0, 400); r.bodyTail = bt.slice(-600); } catch(e) {}",
+    "diag body tail",
+)
+
+required = [
+    'function turnNodes()',
+    'section[data-testid^="conversation-turn-"]',
+    'send-accepted-by=',
+    'pre-turn-count=',
+    'streamingStatusCount',
+    'r.bodyTail',
+]
+for marker in required:
+    if marker not in text:
+        raise SystemExit(f"post-patch verification missing marker: {marker}")
 
 path.write_text(text, encoding="utf-8")
 print("patched", path)
