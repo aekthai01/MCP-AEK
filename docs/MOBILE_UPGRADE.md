@@ -119,14 +119,19 @@ The UI now supports per-session actions, workspace-scoped clear-all, dark/light/
 themes, workspace creation/selection/clone/archive/delete, bounded file browsing and
 text editing with diff preview, Git status/diff/staging/commits/branches, artifact
 discovery/download, and runtime model selection from the bridge's `/v1/models`.
+`GET /api/tasks` returns the newest 50 persisted task statuses. Sending `/api/chat`
+while the UI worker is busy now returns a queued task ID.
 The UI still runs only on loopback. Clone accepts public HTTPS URLs on supported hosts;
 credential-bearing URLs are rejected. `AEK_MODEL` in the environment overrides UI model
 selection. Empty folders may be deleted; files and folders inside `.aek`/`.git` are
 inaccessible from the file UI.
 
-Task queuing and real cancellation remain unimplemented. An active task holds the
-workspace execution lock from request reservation through completion. The UI blocks
-new tasks while one runs. Artifact origins are not recorded; detection is based on
+Task queuing is workspace-local and serialized, with durable queued/running/completed/
+failed status and IDs in SQLite. A failed task does not stop subsequent tasks. After
+an interrupted backend restart, unfinished tasks are marked failed; they are not
+silently replayed. Real cancellation remains unimplemented. An active worker holds the
+workspace execution lock from request reservation through the queue drain. Session
+and workspace mutations are blocked while tasks remain. Artifact origins are not recorded; detection is based on
 file extensions and reports path, size and modification time. It scans at most 5000
 files and shows the newest 100 matches. Workspace size excludes `.git` and `.aek`.
 Push, tag, release and automatic merge are not exposed in the UI.

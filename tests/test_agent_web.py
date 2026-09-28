@@ -71,8 +71,9 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(self.get('/api/status')['session']['id'],a)
         self.app.busy=True
         try:
-            for path,data in [('/api/workspaces',{'name':'bad'}),('/api/sessions',{'title':'bad'}),('/api/chat',{'prompt':'x','session_id':a})]:
+            for path,data in [('/api/workspaces',{'name':'bad'}),('/api/sessions',{'title':'bad'})]:
                 with self.assertRaises(HTTPError):self.get(path,data)
+            self.assertTrue(self.get('/api/chat',{'prompt':'x','session_id':a})['queued'])
         finally:self.app.busy=False
         for raw in [b'{bad',b'[]']:
             with self.assertRaises(HTTPError):self.get('/api/chat',raw=raw)
@@ -156,6 +157,28 @@ class IntegrationTests(unittest.TestCase):
                 with SessionStore(self.app.settings.workspace).execution_lock():pass
             gate.set()
             self.wait()
+    def test_queue_order_and_failure_does_not_block_next(self):
+        gate=threading.Event()
+        original=FakeUpstreamAgent._completion
+        async def delayed(agent,messages,tools):
+            if messages[-1].get('content')=='first':
+                await asyncio.to_thread(gate.wait, 3)
+            return await original(agent,messages,tools)
+        with patch.object(FakeUpstreamAgent,'_completion',delayed):
+            first=self.app.start('first',self.app.session)['request_id']
+            failed=self.app.start('fail',self.app.session)
+            last=self.app.start('last',self.app.session)
+            self.assertTrue(failed['queued'])
+            self.assertTrue(last['queued'])
+            self.assertGreaterEqual([t['status'] for t in self.app.store.tasks()].count('queued'),2)
+            gate.set()
+            self.wait()
+        tasks={t['id']:t for t in self.app.store.tasks()}
+        self.assertEqual(tasks[first]['status'],'completed')
+        self.assertEqual(tasks[failed['request_id']]['status'],'failed')
+        self.assertEqual(tasks[last['request_id']]['status'],'completed')
+        prompts=[m['message']['content'] for m in self.app.store.messages(self.app.session) if m['message']['role']=='user']
+        self.assertEqual(prompts,['first','fail','last'])
     def test_doctor_real_mcp_and_failed_upstream(self):
         data=self.get('/api/diagnostics')
         self.assertTrue(data['mcp_ok']);self.assertFalse(data['upstream_ok']);self.assertEqual(data['tool_count'],13)

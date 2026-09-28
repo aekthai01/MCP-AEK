@@ -53,6 +53,8 @@ class SessionStore:
                 CREATE TABLE IF NOT EXISTS messages(seq INTEGER PRIMARY KEY AUTOINCREMENT, session TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE, data TEXT NOT NULL);
                 CREATE INDEX IF NOT EXISTS messages_session ON messages(session,seq);
                 CREATE TABLE IF NOT EXISTS state(key TEXT PRIMARY KEY, value TEXT);
+                CREATE TABLE IF NOT EXISTS tasks(id TEXT PRIMARY KEY, session TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE, workspace TEXT NOT NULL, prompt TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, started_at TEXT, finished_at TEXT, error TEXT);
+                CREATE INDEX IF NOT EXISTS tasks_status ON tasks(status,created_at);
             ''')
         os.chmod(self.path, 0o600)
 
@@ -165,6 +167,37 @@ class SessionStore:
             db.execute('INSERT INTO sessions(id,title,created_at,updated_at) VALUES(?,?,?,?)', (sid, 'New session', now, now))
             db.execute("INSERT OR REPLACE INTO state VALUES('current',?)", (sid,))
         return {'deleted_sessions': counts[0], 'deleted_messages': counts[1], 'session': self.info(sid)}
+
+    def enqueue(self, sid, prompt):
+        sid = self.resolve(sid)
+        task_id, now = uuid.uuid4().hex, datetime.now(timezone.utc).isoformat()
+        with self.connect() as db:
+            db.execute('INSERT INTO tasks(id,session,workspace,prompt,status,created_at) VALUES(?,?,?,?,?,?)',
+                       (task_id, sid, str(self.workspace), sanitize(prompt, self.secrets), 'queued', now))
+        return task_id
+
+    def next_task(self):
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM tasks WHERE status='queued' ORDER BY created_at,rowid LIMIT 1").fetchone()
+            if row:
+                db.execute("UPDATE tasks SET status='running',started_at=? WHERE id=?",
+                           (datetime.now(timezone.utc).isoformat(), row['id']))
+        return dict(row) if row else None
+
+    def finish_task(self, task_id, error=None):
+        with self.connect() as db:
+            db.execute('UPDATE tasks SET status=?,finished_at=?,error=? WHERE id=?',
+                       ('failed' if error else 'completed', datetime.now(timezone.utc).isoformat(),
+                        sanitize(error, self.secrets) if error else None, task_id))
+
+    def tasks(self):
+        with self.connect() as db:
+            return [dict(row) for row in db.execute('SELECT id,session,workspace,status,created_at,started_at,finished_at,error,substr(prompt,1,160) prompt FROM tasks ORDER BY created_at DESC,rowid DESC LIMIT 50')]
+
+    def recover_tasks(self):
+        with self.connect() as db:
+            db.execute("UPDATE tasks SET status='failed',error='Backend stopped before completion',finished_at=? WHERE status IN ('running','queued')",
+                       (datetime.now(timezone.utc).isoformat(),))
 
     def append(self, sid, message):
         sid = self.resolve(sid)

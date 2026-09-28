@@ -8,7 +8,6 @@ import platform
 import secrets
 import threading
 import time
-import uuid
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.metadata import version
@@ -16,7 +15,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 from .agent import AEKAgent
-from .config import Settings, list_workspaces, set_active_workspace, clone_workspace, workspace_details, set_model, remove_workspace
+from .config import Settings, set_active_workspace, clone_workspace, workspace_details, set_model, remove_workspace
 from .sessions import SessionStore, sanitize
 from .workspace import list_files, inspect_file, save_text, git, artifacts, safe_path, file_action
 
@@ -34,6 +33,11 @@ class App:
         self.busy = False
         self.request_id = None
         self.reload()
+        try:
+            with self.store.execution_lock():
+                self.store.recover_tasks()
+        except ValueError:
+            pass  # Another process still owns the workspace.
 
     def reload(self):
         self.settings = Settings.load()
@@ -65,39 +69,61 @@ class App:
             raise ValueError('prompt must contain 1–48000 UTF-8 bytes')
         with self.lock:
             if self.busy:
-                raise ValueError('a task is already running')
+                if session_id != self.session:
+                    raise ValueError('active session changed; reload before sending')
+                task_id = self.store.enqueue(self.session, prompt)
+                self.emit({'type': 'task_queued', 'task_id': task_id})
+                return {'request_id': task_id, 'queued': True}
             if session_id != self.session:
                 raise ValueError('active session changed; reload before sending')
             reservation = self.store.execution_lock()
             reservation.__enter__()
             try:
-                self.store.append(self.session, {"role": "user", "content": prompt})
+                task_id = self.store.enqueue(self.session, prompt)
                 self.busy = True
-                self.request_id = uuid.uuid4().hex
-                threading.Thread(target=self.worker, args=(prompt, reservation), daemon=True).start()
+                self.request_id = task_id
+                threading.Thread(target=self.worker, args=(reservation,), daemon=True).start()
             except BaseException:
                 self.busy = False
+                if 'task_id' in locals():
+                    self.store.finish_task(task_id, 'Worker could not start')
                 reservation.__exit__(None, None, None)
                 raise
             return {'request_id': self.request_id}
 
-    def worker(self, prompt, reservation):
-        async def run():
-            agent = self.agent_factory(self.settings)
-            try:
-                history = await asyncio.to_thread(self.store.history, self.session, self.settings.context_bytes)
-                await agent.run(prompt, history, store=self.store, session_id=self.session, emit=self.emit, recorded=True)
-            finally:
-                await agent.close()
+    def worker(self, reservation):
+        released = False
         try:
-            asyncio.run(run())
-        except Exception as exc:
-            self.emit({'type': 'error', 'message': f'{type(exc).__name__}: {exc}'})
-        finally:
-            with self.lock:
+            while True:
+                with self.lock:
+                    task = self.store.next_task()
+                    if not task:
+                        reservation.__exit__(None, None, None)
+                        self.busy = False
+                        released = True
+                        return
+                    self.request_id = task['id']
+                async def run():
+                    agent = self.agent_factory(self.settings)
+                    try:
+                        self.store.append(task['session'], {"role": "user", "content": task['prompt']})
+                        history = await asyncio.to_thread(self.store.history, task['session'], self.settings.context_bytes)
+                        await agent.run(task['prompt'], history, store=self.store, session_id=task['session'], emit=self.emit, recorded=True)
+                    finally:
+                        await agent.close()
+                error = None
+                try:
+                    asyncio.run(run())
+                except Exception as exc:
+                    error = f'{type(exc).__name__}: {exc}'
+                    self.emit({'type': 'error', 'message': error})
+                self.store.finish_task(task['id'], error)
                 self.emit({'type': 'request_finished'})
-                reservation.__exit__(None, None, None)
-                self.busy = False
+        finally:
+            if not released:
+                with self.lock:
+                    reservation.__exit__(None, None, None)
+                    self.busy = False
 
     async def diagnostics(self, tools_only=False):
         from mcp import Client
@@ -223,6 +249,8 @@ class Handler(BaseHTTPRequestHandler):
                     if app.busy:
                         raise ValueError('models unavailable while a task is running')
                     return self.respond({'models': asyncio.run(app.models()), 'selected': app.settings.model})
+                if path == '/api/tasks':
+                    return self.respond({'tasks': app.store.tasks()})
                 if path == '/api/workspaces':
                     return self.respond({'workspaces': workspace_details(), 'active': app.settings.active_workspace})
                 if path == '/api/files':

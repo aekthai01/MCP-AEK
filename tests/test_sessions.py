@@ -62,6 +62,11 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(result['deleted_messages'], 1)
         self.assertEqual(self.store.current()['message_count'], 0)
         self.assertEqual(separate.current()['id'], separate_id)
+    def test_interrupted_task_recovery(self):
+        task=self.store.enqueue(self.sid,'work')
+        self.assertEqual(self.store.next_task()['id'],task)
+        SessionStore(self.root).recover_tasks()
+        self.assertEqual(self.store.tasks()[0]['status'],'failed')
     def test_corruption_does_not_silently_reset(self):
         self.store.path.write_bytes(b'not sqlite')
         with self.assertRaises(sqlite3.DatabaseError):SessionStore(self.root)
