@@ -59,7 +59,7 @@ sub_once(
               }
               return null;
             }
-            function findSendBtn() {'''.replace('function findSendBtn() {', 'function findSendBtn() {', 1),
+            function findStopBtn() {''',
     "findSendBtn",
 )
 
@@ -175,8 +175,6 @@ replace_once(
     "acceptance logging",
 )
 
-# Include roleless turn count in the polling log so a future failure is diagnosable
-# without another APK iteration.
 replace_once(
     "                log('loop#' + loopCnt + ' textLen=' + cur.length + ' nodes=' + nodeCount + '/' + preCount + ' stop=' + (stopNow ? 'Y' : 'N') + ' sendBtn=' + (dbgBtn ? (dbgBtn.disabled ? 'disabled' : 'ok') : 'missing') + ' stable=' + stableCnt + ' new=' + (newReply ? 'Y' : 'N'));",
     "                log('loop#' + loopCnt + ' textLen=' + cur.length + ' nodes=' + nodeCount + '/' + preCount + ' turns=' + turnNodes().length + '/' + preTurnCount + ' stop=' + (stopNow ? 'Y' : 'N') + ' sendBtn=' + (dbgBtn ? (dbgBtn.disabled ? 'disabled' : 'ok') : 'missing') + ' stable=' + stableCnt + ' new=' + (newReply ? 'Y' : 'N'));",
@@ -229,7 +227,6 @@ sub_once(
     "diag send button",
 )
 
-# Keep a body tail snapshot for post-failure proof without exposing cookies/tokens.
 replace_once(
     "try { r.bodyHead = document.body ? document.body.innerText.slice(0, 400) : ''; } catch(e) {}",
     "try { var bt = document.body ? document.body.innerText : ''; r.bodyHead = bt.slice(0, 400); r.bodyTail = bt.slice(-600); } catch(e) {}",
@@ -247,6 +244,10 @@ required = [
 for marker in required:
     if marker not in text:
         raise SystemExit(f"post-patch verification missing marker: {marker}")
+if text.count('function findSendBtn()') != 1:
+    raise SystemExit('post-patch verification expected exactly one findSendBtn()')
+if text.count('function findStopBtn()') != 1:
+    raise SystemExit('post-patch verification expected exactly one findStopBtn()')
 
 path.write_text(text, encoding="utf-8")
 print("patched", path)
