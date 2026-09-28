@@ -47,8 +47,26 @@ fi
 
 # A previous failed install can leave an otherwise healthy venv behind. Re-running
 # this command is intentional and repairs/continues the dependency installation.
+# Retry only the Android ETXTBSY race; do not hide real compiler/dependency errors.
 echo '[4/6] Installing MCP-AEK and Python dependencies...'
-.venv/bin/pip install -e .
+PIP_LOG="$ROOT/.termux-pip-install.log"
+for attempt in 1 2 3; do
+  : > "$PIP_LOG"
+  if .venv/bin/pip install -e . 2>&1 | tee "$PIP_LOG"; then
+    rm -f "$PIP_LOG"
+    break
+  fi
+
+  if grep -q 'Text file busy' "$PIP_LOG" && [[ "$attempt" -lt 3 ]]; then
+    echo "Transient Android ETXTBSY during native build; retrying ($attempt/3)..." >&2
+    sleep 2
+    continue
+  fi
+
+  echo 'ERROR: Python dependency installation failed.' >&2
+  echo "Full log kept at: $PIP_LOG" >&2
+  exit 1
+done
 
 echo '[5/6] Preparing configuration and workspace...'
 if [[ ! -f .env ]]; then
