@@ -1,0 +1,56 @@
+name: Build patched ChatGPT bridge APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/patch-chatgpt-bridge.py'
+      - '.github/workflows/build-bridge-apk.yml'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout MCP-AEK
+        uses: actions/checkout@v4
+
+      - name: Checkout upstream bridge
+        run: |
+          git clone https://github.com/qq5855144/chatgpt-free-api-android.git bridge
+          cd bridge
+          git checkout 27eae4c00ea482b44550a68968a44bd34548786e
+
+      - name: Patch current ChatGPT composer DOM selectors
+        run: python scripts/patch-chatgpt-bridge.py
+
+      - name: Verify patch
+        run: |
+          grep -n "form\[data-chatgpt-composer\]" bridge/app/src/main/java/com/cgfree/net/WebViewChatEngine.kt
+          grep -n "composer-submit-button" bridge/app/src/main/java/com/cgfree/net/WebViewChatEngine.kt
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install SDK components
+        run: sdkmanager "platforms;android-34" "build-tools;34.0.0"
+
+      - name: Setup Gradle cache
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build signed release APK
+        working-directory: bridge
+        run: ./gradlew :app:assembleRelease
+
+      - name: Upload patched APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: chatgpt-free-api-android-aek-patched
+          path: bridge/app/build/outputs/apk/release/app-release.apk
+          if-no-files-found: error
