@@ -1,0 +1,24 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mcp-aek"
+version = "0.1.0"
+description = "Mobile-first ChatGPT-to-MCP workspace agent for Android + Termux"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "AEK" }]
+dependencies = [
+  "mcp>=2,<3",
+  "httpx>=0.27,<1",
+  "python-dotenv>=1,<2",
+]
+
+[project.scripts]
+aek = "mcp_aek.cli:main"
+mcp-aek-server = "mcp_aek.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["mcp_aek"]
