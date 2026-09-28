@@ -30,6 +30,7 @@ sub_once(
                 'form[data-chatgpt-composer] [contenteditable="true"][role="textbox"]',
                 '#prompt-textarea[contenteditable="true"]',
                 '#prompt-textarea',
+                '[data-testid="prompt-textarea"]',
                 'textarea[name="prompt-textarea"]'
               ];
               for (var i = 0; i < selectors.length; i++) {
@@ -50,6 +51,7 @@ sub_once(
                 '#composer-submit-button',
                 'form[data-chatgpt-composer] button[type="submit"]',
                 'button[aria-label="Send prompt"]',
+                'button[aria-label="Send message"]',
                 'button[aria-label="Send"]',
                 'button.composer-submit-btn'
               ];
@@ -63,7 +65,6 @@ sub_once(
     "findSendBtn",
 )
 
-# Broaden stop-button detection without depending on locale-specific text only.
 sub_once(
     r'''            function findStopBtn\(\) \{\n.*?            \}\n            function pageError\(\) \{''',
     '''            function findStopBtn() {
@@ -76,10 +77,9 @@ sub_once(
     "findStopBtn",
 )
 
-# ChatGPT currently has multiple turn DOM variants. Role attributes are best when
-# present, but some clients render roleless section[data-testid^=conversation-turn-]
-# containers. The bridge resets to a fresh chat for every API request, so when role
-# metadata is absent the second/newest turn is safely the assistant fallback.
+# Prefer explicit role metadata, then current ChatGPT .agent-turn containers,
+# then roleless conversation-turn containers. Each API request starts from a
+# fresh chat, so the second/newest roleless turn is the assistant fallback.
 sub_once(
     r'''            function assistantText\(\) \{\n.*?            \}\n            function assistantCount\(\) \{\n.*?            \}\n''',
     '''            function roleNodes(role) {
@@ -96,13 +96,19 @@ sub_once(
                 var found = document.querySelectorAll(selectors[si]);
                 if (found && found.length) return found;
               }
+              if (role === 'assistant') {
+                var agents = document.querySelectorAll('.agent-turn');
+                if (agents && agents.length) return agents;
+              }
               return [];
             }
             function turnNodes() {
               var selectors = [
                 'section[data-testid^="conversation-turn-"]',
                 'article[data-testid^="conversation-turn-"]',
-                '[data-testid^="conversation-turn-"]'
+                '[data-testid^="conversation-turn-"]',
+                'section[data-turn-id]',
+                'article[data-turn-id]'
               ];
               for (var ti = 0; ti < selectors.length; ti++) {
                 var found = document.querySelectorAll(selectors[ti]);
@@ -127,7 +133,11 @@ sub_once(
               var content = node.querySelector('.markdown') ||
                 node.querySelector('.prose') ||
                 node.querySelector('[class*="markdown"]') || node;
-              var t = content.innerText || content.textContent || '';
+              var clone = content.cloneNode(true);
+              try {
+                clone.querySelectorAll('button, script, style, [aria-hidden="true"], [data-testid*="copy" i]').forEach(function(n){ n.remove(); });
+              } catch(e) {}
+              var t = clone.textContent || content.innerText || content.textContent || '';
               return t.split(String.fromCharCode(8203)).join('').trim();
             }
             function assistantText() {
@@ -153,6 +163,16 @@ sub_once(
               var turns = turnNodes();
               return turns && turns.length ? Math.ceil(turns.length / 2) : 0;
             }
+            function assistantComplete() {
+              var nodes = roleNodes('assistant');
+              if (!nodes || !nodes.length) return false;
+              var last = nodes[nodes.length - 1];
+              var root = last.closest('[data-turn="assistant"]') ||
+                last.closest('[data-testid^="conversation-turn-"]') ||
+                last.closest('[data-turn-id]') || last;
+              return !!(root.querySelector('button[data-testid="copy-turn-action-button"]') ||
+                root.querySelector('button[aria-label*="Copy response" i]'));
+            }
 ''',
     "assistant DOM",
 )
@@ -177,8 +197,16 @@ replace_once(
 
 replace_once(
     "                log('loop#' + loopCnt + ' textLen=' + cur.length + ' nodes=' + nodeCount + '/' + preCount + ' stop=' + (stopNow ? 'Y' : 'N') + ' sendBtn=' + (dbgBtn ? (dbgBtn.disabled ? 'disabled' : 'ok') : 'missing') + ' stable=' + stableCnt + ' new=' + (newReply ? 'Y' : 'N'));",
-    "                log('loop#' + loopCnt + ' textLen=' + cur.length + ' nodes=' + nodeCount + '/' + preCount + ' turns=' + turnNodes().length + '/' + preTurnCount + ' stop=' + (stopNow ? 'Y' : 'N') + ' sendBtn=' + (dbgBtn ? (dbgBtn.disabled ? 'disabled' : 'ok') : 'missing') + ' stable=' + stableCnt + ' new=' + (newReply ? 'Y' : 'N'));",
+    "                log('loop#' + loopCnt + ' textLen=' + cur.length + ' nodes=' + nodeCount + '/' + preCount + ' turns=' + turnNodes().length + '/' + preTurnCount + ' stop=' + (stopNow ? 'Y' : 'N') + ' complete=' + (assistantComplete() ? 'Y' : 'N') + ' sendBtn=' + (dbgBtn ? (dbgBtn.disabled ? 'disabled' : 'ok') : 'missing') + ' stable=' + stableCnt + ' new=' + (newReply ? 'Y' : 'N'));",
     "poll diagnostics",
+)
+
+# A current ChatGPT assistant turn exposes its Copy-response action when complete.
+# Use that as the strongest completion signal; keep the existing stability fallback.
+replace_once(
+    "              var sendBtn2 = findSendBtn();\n              var done = !stopNow && newReply && sendBtn2 && !sendBtn2.disabled;\n              if (done) { finish(cur); return; }",
+    "              var sendBtn2 = findSendBtn();\n              var done = !stopNow && newReply && assistantComplete();\n              if (done) { finish(cur); return; }",
+    "completion signal",
 )
 
 sub_once(
@@ -186,7 +214,7 @@ sub_once(
     '''  var inp = document.querySelector('form[data-chatgpt-composer] #prompt-textarea') ||
     document.querySelector('form[data-chatgpt-composer] .ProseMirror[contenteditable="true"]') ||
     document.querySelector('form[data-chatgpt-composer] [contenteditable="true"][role="textbox"]') ||
-    document.querySelector('#prompt-textarea');
+    document.querySelector('#prompt-textarea') || document.querySelector('[data-testid="prompt-textarea"]');
   r.input =''',
     "diag input",
 )
@@ -197,9 +225,11 @@ sub_once(
   if (!nodes.length) nodes = document.querySelectorAll('article[data-turn="assistant"]');
   if (!nodes.length) nodes = document.querySelectorAll('[data-testid^="conversation-turn-"][data-turn="assistant"]');
   if (!nodes.length) nodes = document.querySelectorAll('[data-message-author-role="assistant"]');
+  if (!nodes.length) nodes = document.querySelectorAll('.agent-turn');
   var turns = document.querySelectorAll('section[data-testid^="conversation-turn-"]');
   if (!turns.length) turns = document.querySelectorAll('article[data-testid^="conversation-turn-"]');
   if (!turns.length) turns = document.querySelectorAll('[data-testid^="conversation-turn-"]');
+  if (!turns.length) turns = document.querySelectorAll('section[data-turn-id], article[data-turn-id]');
   var markdownNodes = document.querySelectorAll('main .markdown.prose, main [class*="markdown"][class*="prose"]');
   var rolelessAssistant = (!nodes.length && turns.length >= 2) ? turns[turns.length - 1] : null;
   r.assistantCount = nodes.length || (turns.length >= 2 ? Math.floor(turns.length / 2) : markdownNodes.length);
@@ -211,7 +241,9 @@ sub_once(
   if (!userNodes.length) userNodes = document.querySelectorAll('[data-message-author-role="user"]');
   r.userCount = userNodes.length || (turns.length ? Math.ceil(turns.length / 2) : 0);
   r.conversationTurnCount = turns.length;
+  r.agentTurnCount = document.querySelectorAll('.agent-turn').length;
   r.streamingStatusCount = document.querySelectorAll('[data-streaming-response-status]').length;
+  r.copyActionCount = document.querySelectorAll('button[data-testid="copy-turn-action-button"], button[aria-label*="Copy response" i]').length;
 ''',
     "diag turn selectors",
 )
@@ -222,6 +254,7 @@ sub_once(
     document.querySelector('#composer-submit-button') ||
     document.querySelector('form[data-chatgpt-composer] button[type="submit"]') ||
     document.querySelector('button[aria-label="Send prompt"]') ||
+    document.querySelector('button[aria-label="Send message"]') ||
     document.querySelector('button[aria-label="Send"]') ||
     document.querySelector('button.composer-submit-btn');''',
     "diag send button",
@@ -235,10 +268,14 @@ replace_once(
 
 required = [
     'function turnNodes()',
+    '.agent-turn',
+    'copy-turn-action-button',
+    'button[aria-label="Send message"]',
     'section[data-testid^="conversation-turn-"]',
     'send-accepted-by=',
     'pre-turn-count=',
-    'streamingStatusCount',
+    'agentTurnCount',
+    'copyActionCount',
     'r.bodyTail',
 ]
 for marker in required:
@@ -248,6 +285,8 @@ if text.count('function findSendBtn()') != 1:
     raise SystemExit('post-patch verification expected exactly one findSendBtn()')
 if text.count('function findStopBtn()') != 1:
     raise SystemExit('post-patch verification expected exactly one findStopBtn()')
+if text.count('function assistantComplete()') != 1:
+    raise SystemExit('post-patch verification expected exactly one assistantComplete()')
 
 path.write_text(text, encoding="utf-8")
 print("patched", path)
