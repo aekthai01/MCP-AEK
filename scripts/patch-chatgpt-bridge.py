@@ -25,7 +25,7 @@ text, n1 = input_re.subn(input_repl, text, count=1)
 if n1 != 1:
     raise SystemExit('findInput patch target not found exactly once')
 
-send_re = re.compile(r'''            function findSendBtn\(\) \{\n.*?            \}\n            var input = findInput\(\);''', re.S)
+send_re = re.compile(r'''            function findSendBtn\(\) \{\n.*?            \}\n            function findStopBtn\(\) \{''', re.S)
 send_repl = '''            function findSendBtn() {
               var selectors = [
                 'button[data-testid="send-button"]',
@@ -40,7 +40,7 @@ send_repl = '''            function findSendBtn() {
               }
               return null;
             }
-            var input = findInput();'''
+            function findStopBtn() {'''
 text, n2 = send_re.subn(send_repl, text, count=1)
 if n2 != 1:
     raise SystemExit('findSendBtn patch target not found exactly once')
