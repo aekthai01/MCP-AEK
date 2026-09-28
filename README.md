@@ -46,12 +46,23 @@ The bridge does **not** require Codex/Work as its upstream transport. It speaks 
 
 ```bash
 pkg update -y
-pkg install -y git python clang cmake make ninja binutils file ripgrep jq zip unzip tar
+pkg install -y git
 
 git clone https://github.com/aekthai01/MCP-AEK.git
 cd MCP-AEK
 bash scripts/install-termux.sh
 ```
+
+The installer deliberately installs the Termux Rust toolchain (`rust`, `cargo`, `pkg-config`, OpenSSL/libffi headers) in addition to Python/C build tools. MCP v2 currently depends on Python packages such as `rpds-py` and `pydantic-core`; PyPI does not provide Android wheels for every Termux/Python combination, so these modules may need to compile locally. Without system Rust, `maturin` may try to use rustup with `aarch64-unknown-linux-android` and fail.
+
+If an older installation already failed while building `rpds-py`, do **not** delete the repository or virtual environment. Update and rerun the installer:
+
+```bash
+git pull
+bash scripts/install-termux.sh
+```
+
+The installer reuses `.venv` and continues/repairs the interrupted Python dependency installation.
 
 Then make sure your ChatGPT bridge app is running on the phone and its local API is reachable:
 
