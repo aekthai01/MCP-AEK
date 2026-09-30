@@ -32,17 +32,25 @@ class App:
         self.sequence = 0
         self.busy = False
         self.request_id = None
+        # Raw user prompts exist only for tasks accepted by this live process. Persisted
+        # task/message rows remain sanitized and stale tasks are never resumed from them.
+        self.pending_prompts = {}
         self.reload()
-        try:
-            with self.store.execution_lock():
-                self.store.recover_tasks()
-        except ValueError:
-            pass  # Another process still owns the workspace.
 
     def reload(self):
         self.settings = Settings.load()
         self.store = SessionStore(self.settings.workspace, (self.settings.upstream_api_key,))
         self.session = self.store.current()['id']
+        self.pending_prompts.clear()
+        self._recover_if_available()
+
+    def _recover_if_available(self):
+        try:
+            with self.store.execution_lock():
+                self.store.recover_tasks()
+            return True
+        except ValueError:
+            return False  # A live process still owns this workspace; start() retries after acquiring the lock.
 
     def emit(self, event):
         event = sanitize(event, (self.settings.upstream_api_key,))
@@ -72,18 +80,25 @@ class App:
                 raise ValueError('active session changed; reload before sending')
             if self.busy:
                 task_id = self.store.enqueue(self.session, prompt)
+                self.pending_prompts[task_id] = prompt
                 self.emit({'type': 'task_queued', 'task_id': task_id})
                 return {'request_id': task_id, 'queued': True}
             reservation = self.store.execution_lock()
             reservation.__enter__()
             try:
+                # Startup/workspace reload recovery may have been skipped while another
+                # process held the lock. Once we own it, stale work must be failed before
+                # any new task can enter the drain.
+                self.store.recover_tasks()
                 task_id = self.store.enqueue(self.session, prompt)
+                self.pending_prompts[task_id] = prompt
                 self.busy = True
                 self.request_id = task_id
                 threading.Thread(target=self.worker, args=(reservation,), daemon=True).start()
             except BaseException:
                 self.busy = False
                 if 'task_id' in locals():
+                    self.pending_prompts.pop(task_id, None)
                     self.store.finish_task(task_id, 'Worker could not start')
                 reservation.__exit__(None, None, None)
                 raise
@@ -101,24 +116,34 @@ class App:
                         released = True
                         return
                     self.request_id = task['id']
+                    live_prompt = self.pending_prompts.pop(task['id'], None)
 
-                async def run():
-                    agent = self.agent_factory(self.settings)
-                    try:
-                        history = await asyncio.to_thread(
-                            self.store.history_for_task, task['session'], task['id'], self.settings.context_bytes)
-                        await agent.run(task['prompt'], history, store=self.store, session_id=task['session'],
-                                        emit=self.emit, recorded=True, task_id=task['id'])
-                    finally:
-                        await agent.close()
-
-                error = None
-                try:
-                    asyncio.run(run())
-                except Exception as exc:
-                    error = f'{type(exc).__name__}: {exc}'
+                if live_prompt is None:
+                    # Defense in depth: a task restored from SQLite has no raw live prompt
+                    # and must never execute, even if recovery missed it for any reason.
+                    error = 'Queued task cannot resume after process restart'
+                    self.store.finish_task(task['id'], error)
                     self.emit({'type': 'error', 'message': error})
-                self.store.finish_task(task['id'], error)
+                else:
+                    async def run():
+                        agent = self.agent_factory(self.settings)
+                        try:
+                            history = await asyncio.to_thread(
+                                self.store.history_for_task, task['session'], task['id'],
+                                self.settings.context_bytes, live_prompt)
+                            await agent.run(live_prompt, history, store=self.store, session_id=task['session'],
+                                            emit=self.emit, recorded=True, task_id=task['id'])
+                        finally:
+                            await agent.close()
+
+                    error = None
+                    try:
+                        asyncio.run(run())
+                    except Exception as exc:
+                        error = f'{type(exc).__name__}: {exc}'
+                        self.emit({'type': 'error', 'message': error})
+                    self.store.finish_task(task['id'], error)
+
                 with self.lock:
                     queue_pending = self.store.has_queued_tasks()
                     if not queue_pending:
@@ -280,7 +305,7 @@ class Handler(BaseHTTPRequestHandler):
                     return self.respond({'sessions': app.store.list(), 'active': app.session})
                 if path.startswith('/api/sessions/') and path.endswith('/messages'):
                     sid = path.split('/')[3]
-                    return self.respond({'messages': app.store.messages(sid, int(query.get('before', ['0'])[0]), int(query.get('limit', ['50'])[0]))})
+                    return self.respond(app.store.message_page(sid, int(query.get('before', ['0'])[0]), int(query.get('limit', ['50'])[0])))
             assets = {'/': 'index.html', '/app.js': 'app.js', '/theme-init.js': 'theme-init.js', '/style.css': 'style.css', '/manifest.webmanifest': 'manifest.webmanifest', '/icon.svg': 'icon.svg', '/icon-192.png': 'icon-192.png', '/icon-512.png': 'icon-512.png'}
             if path in assets:
                 target = STATIC / assets[path]
