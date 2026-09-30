@@ -1,5 +1,6 @@
 """Workspace-local transactional history. SQLite commits every message before execution continues."""
 from __future__ import annotations
+
 import json
 import os
 import re
@@ -34,42 +35,27 @@ def sanitize(value, secrets=()):
     return value
 
 
-
 def _ensure_git_local_exclude(workspace: Path) -> None:
-    """Ignore .aek through Git metadata without touching the tracked .gitignore."""
-    marker = workspace / '.git'
-    if marker.is_symlink() or not marker.exists():
+    """Ignore .aek only through Git metadata that is provably inside the workspace."""
+    workspace = workspace.resolve()
+    git_dir = workspace / '.git'
+    # Worktree/submodule .git pointer files are intentionally not followed: an untrusted
+    # pointer can escape the workspace. Normal repositories use the safe directory path.
+    if git_dir.is_symlink() or not git_dir.is_dir():
         return
-    git_dir: Path | None = None
-    if marker.is_dir():
-        git_dir = marker.resolve()
-    elif marker.is_file():
-        try:
-            raw = marker.read_text(encoding='utf-8', errors='strict')
-        except OSError:
-            return
-        if len(raw) > 4096 or not raw.startswith('gitdir:'):
-            return
-        value = raw.split(':', 1)[1].strip()
-        candidate = Path(value)
-        git_dir = (workspace / candidate).resolve() if not candidate.is_absolute() else candidate.resolve()
-        if not git_dir.is_dir():
-            return
-    if git_dir is None:
+    resolved_git = git_dir.resolve()
+    if resolved_git.parent != workspace:
         return
-    common = git_dir
-    commondir = git_dir / 'commondir'
-    if commondir.is_file() and not commondir.is_symlink():
-        try:
-            value = commondir.read_text(encoding='utf-8', errors='strict').strip()
-            candidate = Path(value)
-            common = (git_dir / candidate).resolve() if not candidate.is_absolute() else candidate.resolve()
-        except OSError:
-            common = git_dir
-    exclude = common / 'info' / 'exclude'
+    info = resolved_git / 'info'
+    if info.is_symlink():
+        raise ValueError('Git info directory cannot be a symlink')
+    info.mkdir(parents=True, exist_ok=True)
+    resolved_info = info.resolve()
+    if resolved_info.parent != resolved_git:
+        raise ValueError('Git info directory escapes workspace')
+    exclude = resolved_info / 'exclude'
     if exclude.is_symlink():
         raise ValueError('Git local exclude cannot be a symlink')
-    exclude.parent.mkdir(parents=True, exist_ok=True)
     pattern = '/.aek/'
     try:
         existing = exclude.read_text(encoding='utf-8', errors='replace') if exclude.exists() else ''
@@ -228,7 +214,7 @@ class SessionStore:
         return {'deleted_sessions': counts[0], 'deleted_messages': counts[1], 'session': self.info(sid)}
 
     def enqueue(self, sid, prompt):
-        """Persist the user message and queued task in the same committed transaction."""
+        """Persist only a sanitized prompt plus its queued task in one transaction."""
         if not isinstance(prompt, str) or not prompt.strip():
             raise ValueError('prompt must not be empty')
         sid = self.resolve(sid)
@@ -236,8 +222,7 @@ class SessionStore:
         clean_prompt = sanitize(prompt, self.secrets)
         data = json.dumps({'role': 'user', 'content': clean_prompt}, ensure_ascii=False)
         with self.connect() as db:
-            cursor = db.execute('INSERT INTO messages(session,data,task_id) VALUES(?,?,?)',
-                                (sid, data, task_id))
+            cursor = db.execute('INSERT INTO messages(session,data,task_id) VALUES(?,?,?)', (sid, data, task_id))
             message_seq = cursor.lastrowid
             db.execute('UPDATE sessions SET updated_at=? WHERE id=?', (now, sid))
             db.execute('INSERT INTO tasks(id,session,workspace,prompt,status,created_at,message_seq) VALUES(?,?,?,?,?,?,?)',
@@ -253,10 +238,14 @@ class SessionStore:
         return dict(row) if row else None
 
     def finish_task(self, task_id, error=None):
+        now = datetime.now(timezone.utc).isoformat()
         with self.connect() as db:
-            db.execute('UPDATE tasks SET status=?,finished_at=?,error=? WHERE id=?',
-                       ('failed' if error else 'completed', datetime.now(timezone.utc).isoformat(),
-                        sanitize(error, self.secrets) if error else None, task_id))
+            if error:
+                db.execute("UPDATE tasks SET status='failed',finished_at=?,error=? WHERE id=? AND status!='completed'",
+                           (now, sanitize(error, self.secrets), task_id))
+            else:
+                db.execute("UPDATE tasks SET status='completed',finished_at=COALESCE(finished_at,?),error=NULL WHERE id=?",
+                           (now, task_id))
 
     def has_queued_tasks(self):
         with self.connect() as db:
@@ -282,74 +271,156 @@ class SessionStore:
                     pass
         return rows
 
+    @staticmethod
+    def _is_durable_final(raw):
+        try:
+            message = json.loads(raw)
+        except (TypeError, ValueError):
+            return False
+        return message.get('role') == 'assistant' and not message.get('tool_calls')
+
     def recover_tasks(self):
+        """Fail stale tasks, except a running task whose durable final answer already committed."""
+        now = datetime.now(timezone.utc).isoformat()
+        recovered = {'completed': 0, 'failed': 0}
         with self.connect() as db:
-            db.execute("UPDATE tasks SET status='failed',error='Backend stopped before completion',finished_at=? WHERE status IN ('running','queued')",
-                       (datetime.now(timezone.utc).isoformat(),))
+            rows = db.execute("SELECT id,status FROM tasks WHERE status IN ('running','queued')").fetchall()
+            for row in rows:
+                final = False
+                if row['status'] == 'running':
+                    last = db.execute('SELECT data FROM messages WHERE task_id=? ORDER BY seq DESC LIMIT 1',
+                                      (row['id'],)).fetchone()
+                    final = bool(last and self._is_durable_final(last[0]))
+                if final:
+                    db.execute("UPDATE tasks SET status='completed',finished_at=?,error=NULL WHERE id=?", (now, row['id']))
+                    recovered['completed'] += 1
+                else:
+                    db.execute("UPDATE tasks SET status='failed',error='Backend stopped before completion',finished_at=? WHERE id=?",
+                               (now, row['id']))
+                    recovered['failed'] += 1
+        return recovered
 
     def append(self, sid, message, task_id=None):
         sid = self.resolve(sid)
-        data = json.dumps(sanitize(message, self.secrets), ensure_ascii=False)
+        clean = sanitize(message, self.secrets)
+        data = json.dumps(clean, ensure_ascii=False)
+        now = datetime.now(timezone.utc).isoformat()
         with self.connect() as db:
             if task_id is not None and not db.execute(
                     'SELECT 1 FROM tasks WHERE id=? AND session=?', (task_id, sid)).fetchone():
                 raise ValueError('task is not associated with this session')
             db.execute('INSERT INTO messages(session,data,task_id) VALUES(?,?,?)', (sid, data, task_id))
-            db.execute('UPDATE sessions SET updated_at=? WHERE id=?', (datetime.now(timezone.utc).isoformat(), sid))
+            db.execute('UPDATE sessions SET updated_at=? WHERE id=?', (now, sid))
+            if task_id is not None and clean.get('role') == 'assistant' and not clean.get('tool_calls'):
+                # Final assistant durability and task completion share this transaction.
+                db.execute("UPDATE tasks SET status='completed',finished_at=?,error=NULL WHERE id=? AND status='running'",
+                           (now, task_id))
 
-    def messages(self, sid, before=0, limit=100):
-        sid = self.resolve(sid)
-        with self.connect() as db:
-            rows = db.execute('SELECT seq,data FROM messages WHERE session=? AND (?=0 OR seq<?) ORDER BY seq DESC LIMIT ?', (sid, before, before, min(max(limit, 1), 500))).fetchall()
-        return [{'seq': r[0], 'message': json.loads(r[1])} for r in reversed(rows)]
-
-    def history_for_task(self, sid, task_id, budget):
-        '''Build logical task turns while excluding prompts that are still in the future queue.'''
-        sid = self.resolve(sid)
-        with self.connect() as db:
-            current = db.execute('SELECT rowid FROM tasks WHERE id=? AND session=?', (task_id, sid)).fetchone()
-            if not current:
-                raise ValueError('task not found for session')
-            anchors = db.execute('''
+    def _logical_units(self, db, sid, *, before=0, through=0, max_units=2000):
+        task_bound = ''
+        message_bound = ''
+        params = [sid]
+        message_params = [sid]
+        if before:
+            task_bound = ' AND t.message_seq < ?'
+            message_bound = ' AND m.seq < ?'
+            params.append(before)
+            message_params.append(before)
+        elif through:
+            task_bound = ' AND t.message_seq <= ?'
+            message_bound = ' AND m.seq <= ?'
+            params.append(through)
+            message_params.append(through)
+        sql = f'''
+            SELECT kind,ref,anchor FROM (
                 SELECT 'task' kind,t.id ref,t.message_seq anchor
-                FROM tasks t WHERE t.session=? AND t.rowid<=? AND t.message_seq IS NOT NULL
+                FROM tasks t
+                WHERE t.session=? AND t.message_seq IS NOT NULL{task_bound}
                 UNION ALL
                 SELECT 'message' kind,CAST(m.seq AS TEXT) ref,m.seq anchor
-                FROM messages m WHERE m.session=? AND m.task_id IS NULL
-                ORDER BY anchor DESC LIMIT 2000
-            ''', (sid, current[0], sid)).fetchall()
-            units = []
-            size = 0
-            for anchor in anchors:
-                if anchor['kind'] == 'task':
-                    raw = [r[0] for r in db.execute(
-                        'SELECT data FROM messages WHERE session=? AND task_id=? ORDER BY seq',
-                        (sid, anchor['ref']))]
-                else:
-                    row = db.execute('SELECT data FROM messages WHERE session=? AND seq=?',
-                                     (sid, int(anchor['ref']))).fetchone()
-                    raw = [row[0]] if row else []
-                if not raw:
-                    continue
-                cost = sum(len(value.encode('utf-8')) for value in raw)
-                if units and size + cost > budget * 2:
-                    break
-                units.append((anchor['anchor'], [json.loads(value) for value in raw]))
-                size += cost
-            units.sort(key=lambda item: item[0])
-            return [message for _, group in units for message in group]
+                FROM messages m
+                LEFT JOIN tasks t ON t.id=m.task_id AND t.session=m.session
+                WHERE m.session=? AND (m.task_id IS NULL OR t.message_seq IS NULL){message_bound}
+            ) ORDER BY anchor DESC LIMIT ?
+        '''
+        anchors = db.execute(sql, (*params, *message_params, max(1, min(max_units, 5000)))).fetchall()
+        units = []
+        for anchor in anchors:
+            if anchor['kind'] == 'task':
+                rows = db.execute('SELECT seq,data FROM messages WHERE session=? AND task_id=? ORDER BY seq',
+                                  (sid, anchor['ref'])).fetchall()
+            else:
+                row = db.execute('SELECT seq,data FROM messages WHERE session=? AND seq=?',
+                                 (sid, int(anchor['ref']))).fetchone()
+                rows = [row] if row else []
+            if rows:
+                units.append({'anchor': int(anchor['anchor']), 'task_id': anchor['ref'] if anchor['kind'] == 'task' else None,
+                              'rows': [(int(row['seq']), row['data']) for row in rows]})
+        return units
+
+    def message_page(self, sid, before=0, limit=100):
+        sid = self.resolve(sid)
+        limit = min(max(int(limit), 1), 500)
+        with self.connect() as db:
+            units = self._logical_units(db, sid, before=before, max_units=limit + 1)
+        selected = []
+        count = 0
+        for unit in units:
+            if selected and count >= limit:
+                break
+            selected.append(unit)
+            count += len(unit['rows'])
+        has_more = len(units) > len(selected)
+        selected.reverse()
+        rows = []
+        for unit in selected:
+            for seq, raw in unit['rows']:
+                rows.append({'seq': seq, 'cursor': unit['anchor'], 'message': json.loads(raw)})
+        return {'messages': rows, 'has_more': has_more}
+
+    def messages(self, sid, before=0, limit=100):
+        return self.message_page(sid, before, limit)['messages']
+
+    def history_for_task(self, sid, task_id, budget, live_prompt=None):
+        """Build logical task turns, excluding future queued prompts; optionally restore the live raw prompt in RAM."""
+        sid = self.resolve(sid)
+        with self.connect() as db:
+            current = db.execute('SELECT message_seq FROM tasks WHERE id=? AND session=?', (task_id, sid)).fetchone()
+            if not current or current['message_seq'] is None:
+                raise ValueError('task not found for session')
+            units = self._logical_units(db, sid, through=int(current['message_seq']), max_units=2000)
+        selected = []
+        size = 0
+        for unit in units:
+            cost = sum(len(raw.encode('utf-8')) for _, raw in unit['rows'])
+            if selected and size + cost > budget * 2:
+                break
+            messages = [json.loads(raw) for _, raw in unit['rows']]
+            if unit['task_id'] == task_id and live_prompt is not None:
+                for message in messages:
+                    if message.get('role') == 'user':
+                        message['content'] = live_prompt
+                        break
+            selected.append((unit['anchor'], messages))
+            size += cost
+        selected.sort(key=lambda item: item[0])
+        return [message for _, group in selected for message in group]
 
     def history(self, sid, budget):
-        # Read only a bounded suffix, without loading a lifetime of history into RAM.
-        result, size = [], 0
+        # Read only a bounded logical suffix, without loading a lifetime of history into RAM.
+        sid = self.resolve(sid)
         with self.connect() as db:
-            for row in db.execute('SELECT data FROM messages WHERE session=? ORDER BY seq DESC', (self.resolve(sid),)):
-                size += len(row[0].encode('utf-8'))
-                if size > budget * 2:
-                    break
-                result.append(json.loads(row[0]))
-        result.reverse()
-        return result
+            units = self._logical_units(db, sid, max_units=2000)
+        selected = []
+        size = 0
+        for unit in units:
+            cost = sum(len(raw.encode('utf-8')) for _, raw in unit['rows'])
+            if selected and size + cost > budget * 2:
+                break
+            selected.append((unit['anchor'], [json.loads(raw) for _, raw in unit['rows']]))
+            size += cost
+        selected.sort(key=lambda item: item[0])
+        return [message for _, group in selected for message in group]
 
 
 def context_messages(history, system, budget=60000, summary=''):
