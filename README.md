@@ -153,6 +153,7 @@ AEK_ACTIVE_WORKSPACE=default
 AEK_ENABLE_SHELL=0
 AEK_TOOL_TIMEOUT=120
 AEK_MAX_TOOL_ROUNDS=24
+AEK_CONTEXT_BYTES=60000
 ```
 
 The model name should be changed to one returned by your local `/v1/models` endpoint.
@@ -161,17 +162,19 @@ The model name should be changed to one returned by your local `/v1/models` endp
 
 File operations are restricted to the active workspace after path resolution. `run_command` runs an executable directly with an argument array and workspace cwd, avoiding a shell by default. `shell_exec` is intentionally opt-in because a shell cannot be reliably sandboxed by string filtering.
 
+Session metadata lives under `<workspace>/.aek`. For a normal Git repository whose `.git` is a real directory inside the workspace, MCP-AEK adds `/.aek/` to `.git/info/exclude` without changing the tracked `.gitignore`. It deliberately does not follow `.git` pointer files to external Git metadata, so an untrusted pointer cannot make MCP-AEK write outside the workspace.
+
 This project is intended for code, build, interoperability, debugging, and analysis of files/systems you own or are authorized to inspect.
 
 ## Status
 
-Persistent mobile chat is implemented; actual Android/bridge acceptance checks are listed below.
+MCP-AEK `0.3.0` is the persistent mobile engineering-workspace release candidate. Actual Android/bridge acceptance checks remain separate from Linux CI.
 
-## Persistent mobile chat (0.2)
+## Persistent mobile chat (0.3)
 
 ```bash
 ./aek ui                     # http://127.0.0.1:8766
-./aek ui --port 8766 --open   # optional browser launch
+./aek ui --port 8766 --open  # optional browser launch
 ./aek chat                   # resume the current workspace session
 ./aek chat new "luas"
 ./aek chat new "web-ui"
@@ -183,31 +186,18 @@ Persistent mobile chat is implemented; actual Android/bridge acceptance checks a
 ./aek chat delete web-ui --yes
 ```
 
-The mobile UI has session and workspace switching, real MCP activity, expandable
-outputs, copyable code, tool availability, and sanitized diagnostics. Quick actions
-only fill the composer. `/clear` starts a new session and keeps the previous one.
-`run` remains one-shot; it does not append to the current chat.
+The mobile UI has session and workspace switching, real MCP activity, expandable outputs, copyable code, tool availability, Git/file panels, task status, themes, and sanitized diagnostics. Quick actions only fill the composer. `/clear` starts a new session and keeps the previous one. `run` remains one-shot; it does not append to the current chat.
 
-History is committed after every user, assistant, tool-call and tool-result message
-in `<workspace>/.aek/sessions.sqlite3`. User prompts submitted over HTTP are committed
-before the API acknowledges them. Session metadata and the active session are in the
-same database. SQLite transactions with `synchronous=FULL` retain committed messages
-after process death; uncommitted writes roll back. Stop the backend before copying
-the `.aek` directory for backup. Corrupt databases fail visibly, never silently reset.
-History in older versions lived only in RAM and cannot be recovered after exit.
+History is stored in `<workspace>/.aek/sessions.sqlite3`. For browser tasks the sanitized user message and task row are committed atomically before `/api/chat` returns HTTP 202. The original unsanitized prompt is retained only in the live process long enough to execute that accepted task; it is not persisted in SQLite or emitted in UI events. If the process dies before a queued task starts, that task is marked failed after recovery and is never silently replayed from its sanitized stored copy.
 
-`AEK_CONTEXT_BYTES=60000` bounds serialized message context in UTF-8 bytes (not tokens;
-model/tool-schema overhead is separate). Only recent whole turns are sent. An
-oversized newest turn fails clearly, preserving disk history. Incomplete tool-call
-sets after a crash are omitted from the next request, not fabricated or rerun.
-`chat summary` supplies optional user-maintained notes, explicitly labeled unverified;
-automatic model summarization is not implemented. Raw non-secret evidence remains in
-history, with stable message sequence numbers and paginated retrieval.
+Queue-associated messages are presented in logical task order, so a durable physical sequence such as `user A, user B, assistant A, assistant B` is exposed to model history, CLI continuation and UI pagination as `user A, assistant A, user B, assistant B`. Older sessions without task associations keep their legacy sequence ordering. UI history pagination uses a logical cursor while physical SQLite sequence numbers remain stable evidence identifiers.
 
-Open the UI in Android Chrome, then use **Add to Home screen** (or **Install**, when
-offered). The manifest contains standalone mode and local PNG icons. This shortcut
-does not start Termux or the bridge; both must remain running. There is no offline
-chat cache. The UI reports reconnecting when the backend is unavailable.
+A final assistant message and task completion are committed together. Recovery also reconciles an interrupted running task that already has a durable final assistant response as completed, rather than incorrectly downgrading it to failed.
 
-See [mobile upgrade notes](docs/MOBILE_UPGRADE.md) for security, validation boundaries,
-and exact Termux smoke tests.
+`AEK_CONTEXT_BYTES=60000` bounds serialized message context in UTF-8 bytes (not tokens; model/tool-schema overhead is separate). Only recent whole turns are sent. An oversized newest turn fails clearly, preserving disk history. Incomplete tool-call sets after a crash are omitted from the next request, not fabricated or rerun. `chat summary` supplies optional user-maintained notes, explicitly labeled unverified; automatic model summarization is not implemented.
+
+Open the UI in Android Chrome, then use **Add to Home screen** (or **Install**, when offered). The shortcut does not start Termux or the bridge; both must remain running. There is no offline chat cache. The UI reports reconnecting when the backend is unavailable.
+
+Known deferred work for 0.3: real cancellation, streaming Git-clone progress, artifact origin/task attribution, and the proposed workflow engine/shortcuts. Push, tag, release and automatic merge are not exposed in the UI.
+
+See [mobile upgrade notes](docs/MOBILE_UPGRADE.md) for security details, validation boundaries, and exact Termux smoke tests.
