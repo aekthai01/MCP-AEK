@@ -1,150 +1,106 @@
-# Mobile chat upgrade
+# Mobile engineering workspace upgrade — v0.3 release candidate
 
 ## Implementation and compatibility
 
-The existing `cli → AEKAgent → HTTP completion → MCP stdio server → tools` path remains.
-The bridge patches and APK build workflow are unchanged. The model comes from existing
-configuration. No new runtime dependency was introduced: Python's HTTP server, SQLite,
-threading and asyncio supply the local API and persistence; the frontend is vanilla JS.
-A single worker serializes requests inside a UI backend. Each MCP child receives a
-pinned workspace, preventing another CLI process changing its working workspace.
-A nonblocking workspace file lock prevents concurrent persistent chat execution and
-session mutations across processes. Tools still run with the Termux user's privileges.
+The existing `cli → AEKAgent → HTTP completion → MCP stdio server → tools` path remains. The bridge patches and APK build workflow are unchanged. The model still comes from the existing configuration/bridge. Python's HTTP server, SQLite, threading and asyncio provide the local API and persistence; the frontend remains vanilla JavaScript.
 
-The API only binds `127.0.0.1`. Static paths are an explicit allowlist. JSON POSTs are
-size-limited, require a fresh per-process request token and enforce same-origin/Host
-checks. No CORS allowance is emitted. Browser output uses text nodes and a deliberately
-small Markdown subset (headings, bold, inline code, fenced code); raw HTML, remote
-images, tables and link parsing are not supported. CSP excludes inline scripts and
-framing. Session directories use mode 0700, databases 0600, and session storage rejects
-symlinks. Workspace symlinks and file traversal are rejected; recursive source search
-skips symlink files.
+A single UI worker serializes agent execution inside one workspace. Each MCP child receives a pinned workspace. A nonblocking workspace execution lock prevents persistent chat execution and session mutations from racing across processes. Tools still run with the Termux user's privileges; workspace path checks are **not** an OS sandbox.
 
-Configured upstream keys, structured token/cookie/password fields and recognizable
-credential strings are redacted from stored messages, displayed events and diagnostics.
-This is not a general-purpose secret detector: do not paste unlabelled credentials or
-ask tools to dump credentials. Redaction takes precedence over byte-exact history.
-Do not publish the session database. Arbitrary executable tools (`python`, compilers,
-`git`, etc.) can access anything permitted to the Termux UID; workspace cwd/path checks
-are **not an OS sandbox**. Disabling `shell_exec` disables that tool only, not equivalent
-capabilities of other executables. Run only trusted tasks on files you are authorized
-to inspect. A local same-user malicious process is outside this security boundary.
+## Persistence and queue semantics
+
+Session history is stored in `<workspace>/.aek/sessions.sqlite3` with `synchronous=FULL`.
+
+For browser submissions:
+
+- the task row and a **sanitized** user message are committed in one SQLite transaction before `/api/chat` returns HTTP 202;
+- the original raw prompt exists only in the live backend's in-memory pending queue and is supplied to the model for that accepted task;
+- raw secrets are not intentionally persisted in task/message rows or emitted in task/UI events;
+- if the backend dies before a queued task starts, recovery marks that stale task failed and does not replay it from SQLite;
+- after obtaining the workspace execution lock, a new worker always performs stale-task recovery **before** enqueuing/draining new work, covering startup recovery that was previously skipped because another process temporarily held the lock;
+- switching into a workspace also attempts recovery immediately, with the same guaranteed recovery before later execution.
+
+Task-associated history uses logical task ordering. SQLite may physically contain:
+
+```text
+user A
+user B
+assistant A
+assistant B
+```
+
+when A and B were acknowledged before A completed. Model history, CLI continuation and browser history expose the logical conversation as:
+
+```text
+user A
+assistant A
+user B
+assistant B
+```
+
+Legacy messages without task associations retain their original physical sequence ordering. `/api/sessions/:id/messages` returns a logical pagination cursor in each row; the UI uses that cursor rather than assuming physical `seq` alone describes conversation order.
+
+A task's final assistant message and its `completed` state are persisted in the same SQLite transaction. Recovery also reconciles a stale `running` task that already has a durable final assistant response as completed. A late worker error cannot downgrade a transactionally completed task to failed.
+
+## Git metadata safety
+
+MCP-AEK keeps `.aek` out of `git status` without modifying tracked `.gitignore` files. Automatic local exclusion is performed only when `<workspace>/.git` is a real directory inside the workspace. `.git` pointer files are deliberately not followed, because an untrusted absolute or relative `gitdir:` target could otherwise cause writes outside the workspace boundary.
+
+The file/Git UI continues to reject `.git`, `.aek`, traversal paths and symlink escapes. Git stage/unstage supports tracked deleted files.
 
 ## API and live events
 
-- `GET /api/status`: workspace, session, busy state and local request token.
-- `GET /api/workspaces`; `POST /api/workspaces` with `name`: create/select workspace.
-- `GET /api/sessions`; `POST /api/sessions` with optional `title`: create session.
-- `POST /api/sessions/use` with `session_id`.
-- `POST /api/sessions/rename` with `title` (current session).
-- `POST /api/sessions/summary` with `summary` (current session, max 8000 bytes).
-- `POST /api/sessions/delete` with `session_id` and `confirm: true`.
-- `GET /api/sessions/:id/messages?before=<seq>&limit=50`: chronological page.
-- `POST /api/chat` with `prompt` and current `session_id`: 202, request ID.
-- `GET /api/events`: SSE with IDs, Last-Event-ID replay and heartbeat.
-- `GET /api/tools`, `GET /api/diagnostics`: actual runtime checks, unavailable during tasks.
+- `GET /api/status`: workspace, session, model, busy state and local request token.
+- `GET /api/workspaces`; workspace create/select/rename/archive/delete and synchronous public HTTPS clone.
+- `GET /api/sessions`; create/use/rename/delete/clear workspace history.
+- `GET /api/sessions/:id/messages?before=<logical-cursor>&limit=50`: logical chronological page.
+- `POST /api/chat`: HTTP 202 with running/queued task ID; queueing remains available while the backend worker is busy.
+- `GET /api/tasks`: newest persisted task records including status, workspace/session, timestamps and duration.
+- `GET /api/events`: SSE with bounded replay.
+- file explorer/edit/preview, Git cockpit, artifacts, tools, diagnostics and model selection routes remain available as implemented.
 
-Every POST requires `Content-Type: application/json` and `X-AEK-Token` from status.
-Errors have shape `{"error":{"message":"..."}}`.
-Events: `request_started`, `model_started`, `model_completed`, `tool_started`,
-`tool_completed`, `tool_failed`, `final_answer`, `error`, `request_finished`.
-Tool duration uses a monotonic clock. Events come from execution, not a simulated timer.
-Replay is bounded to 500 events; reconnect also reloads status and durable messages.
-History pages default to 50, maximum 500; frontend keeps at most 150 message elements.
-The model response is not token-streamed. Stop/cancel is intentionally absent: the
-current process tools cannot guarantee cancellation of child commands. Tool timeout
-and upstream HTTP timeout still apply. After a crash, inspect tools/files before retrying;
-external side effects are not transactionally rolled back or automatically replayed.
+Every POST requires JSON plus the per-process `X-AEK-Token`, and same-origin/Host checks remain enforced. Static assets are served from an allowlist. Browser message rendering uses text nodes and a deliberately small Markdown subset rather than raw HTML.
 
-## Upgrade
+The frontend keeps the composer available while backend work is running so another task can be queued. Separately, an in-flight `/api/chat` submit is guarded: double tap/Enter cannot enqueue the same prompt twice before that POST is acknowledged.
 
-Install this branch/revision using the existing virtual environment:
+## Security notes
 
-```bash
-cd ~/MCP-AEK
-git fetch origin
-git switch feat/persistent-mobile-chat
-.venv/bin/pip install -e .
-./aek doctor
-./aek ui
-```
+Configured upstream keys, structured token/cookie/password fields and recognizable credential strings are redacted from stored messages, task metadata, displayed events and diagnostics. This remains a bounded redaction layer, not a general-purpose secret detector. Do not publish `.aek/sessions.sqlite3` or intentionally ask tools to dump secrets.
 
-Keep your existing `.env`, workspaces, bridge app and patched APK. Do not overwrite
-`.env` with the example. Set `AEK_MODEL` only to a name returned by your bridge.
-No migration is required; the first persistent chat creates a new local session.
+`run_command`, compilers, Python, Git and other executables can access anything allowed to the Termux UID. `AEK_ENABLE_SHELL=0` disables `shell_exec` only; it is not a process sandbox.
 
-## Termux acceptance tests still required
+## v0.3 package version
 
-1. Start the existing bridge and run `./aek doctor`; verify model and MCP health.
-2. Run `./aek run "ตอบ OK เท่านั้น"` and
-   `./aek run "เรียก workspace_info แล้วบอกชื่อ active workspace เท่านั้น"`.
-3. Run `./aek chat`, send `จำรหัสทดสอบนี้ไว้ ABC-123`, then `/exit`.
-   Restart `./aek chat` and ask `รหัสเมื่อกี้คืออะไร`.
-4. Create `./aek chat new luas` and `./aek chat new web-ui`; list and switch using
-   `./aek chat use luas`. Verify history isolation and `/clear` retains the old session.
-5. Run `./aek ui`; open `http://127.0.0.1:8766` in Chrome. Ask for `workspace_info`.
-   Observe actual tool start/completion and final output. Check Tools and Diagnostics.
-6. While running a task, verify session/workspace changes are blocked. Reload the page;
-   verify current activity/history recover. Stop/restart the backend and verify history.
-7. On the actual phone check keyboard resize, scrolling, copy buttons, long code blocks,
-   portrait/landscape, Add to Home screen and standalone launch. Background Termux
-   survival depends on Android battery restrictions and cannot be promised by this app.
+The release-candidate package metadata and `mcp_aek.__version__` are `0.3.0`.
+
+## Known limitations / deferred work
+
+The following remain explicitly deferred and must not be represented as implemented:
+
+- **Real cancel:** no guaranteed process-group cancellation/rollback of running tools.
+- **Streaming clone progress:** Git clone is synchronous and surfaces final success/failure; partial targets are cleaned on timeout/exception/non-zero failure.
+- **Artifact origin:** artifacts are discovered by bounded extension scan; originating task/session attribution is not recorded.
+- **Workflow engine:** proposed engineering workflow shortcuts/orchestration are not implemented.
+- Model responses are not token-streamed.
+- Push, tag, release and automatic merge are not exposed by this UI.
 
 ## Validation boundaries
 
-Automated tests use a real MCP subprocess and real local HTTP requests. The upstream
-model is deterministic test code or a local HTTP fixture; they do not prove live
-ChatGPT/WebView behavior. Process-exit tests prove SQLite commit/rollback and history
-restoration. There is no Android device or real bridge in the Linux validation environment.
-Chromium was unavailable and its download failed, so rendered screenshot/mobile keyboard
-validation was not performed. Python 3.14 on Termux and PWA install behavior need the
-manual checks above. Existing CI runs Python 3.12.
+Linux automated tests use deterministic local upstreams and real local HTTP/SQLite behavior. Tests that exercise the normal agent path use the installed MCP dependency. They do not prove Android WebView/bridge behavior, PWA installation, mobile keyboard layout, Android background survival, or Termux Python 3.14 behavior.
 
-## Executed validation (Linux, Python 3.12)
+The earlier **23-test** result belonged to the v0.2-era tree and is historical. It is **not** current v0.3 HEAD evidence. The v0.3 release candidate must be validated from its actual HEAD with:
 
-- `python -m unittest discover -s tests -v`: **23 tests passed**, 21.903 seconds.
-- `python -m compileall -q mcp_aek tests`: passed.
-- `node --check mcp_aek/static/app.js`: passed.
-- MCP server/package imports and CLI parser checks: passed.
-- Real `./aek ui --port 8877` subprocess + `curl --noproxy '*' --fail` against
-  `/api/status`: HTTP success, correct workspace/session/model/busy state.
-- Wheel build: succeeded; inspected archive contains all seven static assets.
-- `git diff --check`: passed. Existing bridge patch/workflow diff: empty.
-- The negative tool traversal test intentionally emits an MCP exception on stderr;
-  it verifies `tool_failed`, durable error output, and normalized call IDs.
+```bash
+python -m unittest discover -s tests -v
+python -m compileall -q mcp_aek tests
+node --check mcp_aek/static/app.js
+git diff --check
+```
 
-## v0.3 branch changes and device checks
+The exact current GitHub Actions run ID, test count and result should be taken from PR #1 after the release-candidate commit triggers a fresh run; do not infer success from the earlier `action_required` run that produced zero jobs.
 
-The UI now supports per-session actions, workspace-scoped clear-all, dark/light/system
-themes, workspace creation/selection/clone/rename/archive/delete, bounded file browsing and
-text editing with diff preview, Git status/diff/staging/commits/branches, artifact
-discovery/download, and runtime model selection from the bridge's `/v1/models`.
-`GET /api/tasks` returns the newest 50 persisted task statuses. Sending `/api/chat`
-while the UI worker is busy now returns a queued task ID.
-The UI still runs only on loopback. Clone accepts public HTTPS URLs on supported hosts;
-credential-bearing URLs are rejected. `AEK_MODEL` in the environment overrides UI model
-selection. Empty folders may be deleted; files and folders inside `.aek`/`.git` are
-inaccessible from the file UI.
+## Termux acceptance tests still required
 
-Task queuing is workspace-local and serialized, with durable queued/running/completed/
-failed status and IDs in SQLite. The user prompt and task row are committed atomically
-before `/api/chat` returns 202; task-associated messages prevent a queued prompt from
-being duplicated when its worker starts. A failed task does not stop subsequent tasks.
-After an interrupted backend restart, unfinished tasks are marked failed while their
-committed user prompts remain in history; tasks are not silently replayed. The task
-panel shows workspace/session, created/started/finished timestamps and duration. An
-active worker holds the workspace execution lock from reservation through queue drain.
-Session and workspace mutations are blocked while tasks remain.
-
-Known limitations / deferred work: real cancellation is not implemented; Git clone is
-synchronous and reports only final success/failure (streaming clone progress is deferred);
-artifact origin/task attribution is not recorded; and the proposed engineering workflow
-engine/shortcuts are deferred. Artifact discovery is extension-based and reports path,
-size and modification time, scanning at most 5000 files and showing the newest 100.
-Workspace size excludes `.git` and `.aek`. Push, tag, release and automatic merge are
-not exposed in the UI.
-
-On Termux, update the feature branch, reinstall, and check:
+After CI passes, update the feature branch on the phone and reinstall into the existing virtual environment:
 
 ```bash
 cd ~/MCP-AEK
@@ -154,15 +110,9 @@ git pull --ff-only origin feat/persistent-mobile-chat
 .venv/bin/pip install -e .
 ./aek doctor
 ./aek run "ตอบ OK เท่านั้น"
+./aek run "เรียก workspace_info แล้วบอกชื่อ active workspace เท่านั้น"
 ./aek chat
 ./aek ui
 ```
 
-In the browser: delete a non-active and active session, clear the current workspace
-after typing its name, switch all three themes, create/switch workspace and clone a
-public repository, browse/edit a text file and review its diff, inspect Git status
-and diff, and inspect tool activity. Reload and restart the backend, then verify
-session persistence, theme persistence and workspace isolation. Check keyboard,
-portrait/landscape and PWA behavior on the phone. Confirm no credentials appear
-in diagnostics or clone errors. Python 3.14/Android and the patched bridge need
-this real-device check; Linux tests cannot establish them.
+On the real Android/Termux device verify persistent session restart, multiple-session isolation, browser queueing, backend restart without stale task replay, workspace switching, Git cleanliness, deleted-file stage/unstage, themes, file editing, tool activity, diagnostics redaction, keyboard resize, portrait/landscape and Home-screen/PWA behavior. Existing bridge patches should be exercised unchanged against the live bridge.
