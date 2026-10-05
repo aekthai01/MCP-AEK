@@ -1,0 +1,28 @@
+name: Test ChatGPT Web Bridge V2
+
+on:
+  pull_request:
+    paths:
+      - 'scripts/aek-chatgpt-web.py'
+      - 'scripts/install-chatgpt-web-bridge-v2-termux.sh'
+      - 'opencode-skill/chatgpt-web-android/**'
+      - 'docs/CHATGPT_WEB_BRIDGE_V2.md'
+      - '.github/workflows/test-chatgpt-web-bridge-v2.yml'
+  workflow_dispatch:
+
+jobs:
+  static-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Compile Python wrapper
+        run: python -m py_compile scripts/aek-chatgpt-web.py
+      - name: Validate Termux installer syntax
+        run: bash -n scripts/install-chatgpt-web-bridge-v2-termux.sh
+      - name: Verify fail-closed Temporary Chat guard exists
+        run: |
+          grep -n 'temporary_chat_unverified' scripts/aek-chatgpt-web.py
+          grep -n 'Temporary Chat' opencode-skill/chatgpt-web-android/SKILL.md
